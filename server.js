@@ -143,7 +143,6 @@ app.post('/api/start', async (req, res) => {
             return res.json({ success: false, error: 'User ID required' });
         }
         
-        // Check if user already has active key
         const { data: existingKey } = await supabase
             .from('keys')
             .select('*')
@@ -161,7 +160,6 @@ app.post('/api/start', async (req, res) => {
             });
         }
         
-        // Create or get user
         let { data: user } = await supabase
             .from('users')
             .select('*')
@@ -286,7 +284,7 @@ app.post('/api/step2', async (req, res) => {
 });
 
 // ============================================================
-// API: CLAIM KEY (USER CLAIMED - NO IP LOCK YET)
+// API: CLAIM KEY (USER CLAIMED - AUTO IP LOCK)
 // ============================================================
 app.post('/api/claim', async (req, res) => {
     try {
@@ -328,7 +326,7 @@ app.post('/api/claim', async (req, res) => {
         const newKey = generateKey();
         const expiryMs = Date.now() + (durationHours * 3600000);
         
-        // USER KEY: is_admin_key = 0, locked_ip = NULL (will be locked on first use)
+        // USER KEY: is_admin_key = 0, locked_ip = NULL (auto lock on first use)
         const { error: insertError } = await supabase
             .from('keys')
             .insert({
@@ -340,7 +338,7 @@ app.post('/api/claim', async (req, res) => {
                 status: 'active',
                 is_admin_key: 0,
                 created_by: 'user',
-                locked_ip: null  // Not locked yet - will lock on first use
+                locked_ip: null
             });
         
         if (insertError) {
@@ -474,14 +472,34 @@ app.post('/api/verify-key', async (req, res) => {
             return res.json({ valid: false, error: 'Key has expired' });
         }
         
-        // ============================================================
-        // AUTO IP LOCK LOGIC:
-        // - If key has no locked_ip yet → lock it to current IP (first use)
-        // - If key has locked_ip → check if matches current IP
-        // ============================================================
+        const ipLockEnabled = await getSetting('ip_lock_enabled', 'true');
         
+        // Handle NO LOCK (0.0.0.0)
+        if (keyData.locked_ip === '0.0.0.0') {
+            console.log(`✅ [NO LOCK] Key has no IP restriction`);
+            
+            await supabase
+                .from('key_usage')
+                .insert({
+                    key_text: key,
+                    device_id: userIp,
+                    used_at: Date.now(),
+                    user_agent: req.headers['user-agent'],
+                    ip_address: userIp
+                });
+            
+            return res.json({
+                valid: true,
+                key: keyData.key_text,
+                duration: keyData.duration_hours,
+                expiryMs: keyData.expiry_ms,
+                remaining: formatTimeRemaining(keyData.expiry_ms),
+                message: `✅ Key valid! (No IP lock - any IP can use)`
+            });
+        }
+        
+        // Handle AUTO LOCK (NULL) - lock to first IP
         if (!keyData.locked_ip) {
-            // First time using this key - LOCK IT to this IP
             console.log(`🔒 Locking key ${key} to IP: ${userIp}`);
             
             await supabase
@@ -492,7 +510,6 @@ app.post('/api/verify-key', async (req, res) => {
                 })
                 .eq('key_text', key);
             
-            // Record usage
             await supabase
                 .from('key_usage')
                 .insert({
@@ -510,11 +527,11 @@ app.post('/api/verify-key', async (req, res) => {
                 expiryMs: keyData.expiry_ms,
                 remaining: formatTimeRemaining(keyData.expiry_ms),
                 lockedIp: userIp,
-                message: `✅ Key locked to your IP: ${userIp}. This key can only be used from this IP address.`
+                message: `✅ Key locked to your IP: ${userIp}`
             });
         }
         
-        // Key already has locked_ip - check if matches
+        // Handle CUSTOM IP LOCK - check if matches
         if (keyData.locked_ip !== userIp) {
             console.log(`❌ [BLOCKED] IP mismatch. Key locked to: ${keyData.locked_ip}, Request from: ${userIp}`);
             return res.json({ 
@@ -523,10 +540,8 @@ app.post('/api/verify-key', async (req, res) => {
             });
         }
         
-        // Same IP - allowed
         console.log(`✅ [SUCCESS] IP matches: ${userIp}`);
         
-        // Record usage
         await supabase
             .from('key_usage')
             .insert({
@@ -627,98 +642,49 @@ app.post('/api/admin/users', verifyAdmin, async (req, res) => {
 });
 
 // ============================================================
-// API: ADMIN ADD KEY (WITH OPTIONAL IP LOCK)
+// API: ADMIN ADD KEY (WITH 3 IP LOCK OPTIONS)
 // ============================================================
 app.post('/api/admin/add-key', verifyAdmin, async (req, res) => {
-    const { userId, keyText, days = 0, hours = 0, minutes = 0, lockToIp = null } = req.body;
-    
-    if (!userId) {
-        return res.json({ success: false, error: 'User ID required' });
-    }
-    
-    const totalHours = days * 24 + hours + minutes / 60;
-    if (totalHours <= 0) {
-        return res.json({ success: false, error: 'Duration must be greater than 0' });
-    }
-    
-    const expiryMs = Date.now() + (totalHours * 3600000);
-    const newKey = keyText || generateKey();
-    
-    // ADMIN KEY: is_admin_key = 1, can set custom IP lock or leave null
-    const { error } = await supabase
-        .from('keys')
-        .insert({
-            key_text: newKey,
-            user_id: userId,
-            duration_hours: totalHours,
-            duration_days: days,
-            duration_minutes: minutes,
-            expiry_ms: expiryMs,
-            created_at: Date.now(),
-            status: 'active',
-            is_admin_key: 1,
-            created_by: 'admin',
-            locked_ip: lockToIp || null  // Can be specific IP or null (auto-lock on first use)
-        });
-    
-    if (error) {
-        return res.json({ success: false, error: error.message });
-    }
-    
-    // Update user key count
-    const { data: user } = await supabase
-        .from('users')
-        .select('keys_generated')
-        .eq('user_id', userId)
-        .maybeSingle();
-    
-    if (user) {
-        await supabase
-            .from('users')
-            .update({ keys_generated: (user.keys_generated || 0) + 1 })
-            .eq('user_id', userId);
-    } else {
-        await supabase
-            .from('users')
-            .insert({
-                user_id: userId,
-                keys_generated: 1,
-                created_at: Date.now()
-            });
-    }
-    
-    const lockMessage = lockToIp ? `Locked to IP: ${lockToIp}` : 'Will be locked to first IP that uses it';
-    
-    res.json({ 
-        success: true, 
-        key: newKey, 
-        expiryMs: expiryMs,
-        expiryFormatted: new Date(expiryMs).toLocaleString(),
-        lockedIp: lockToIp || 'auto (first use)',
-        message: `✅ Key created! ${lockMessage}`
-    });
-});
-
-// ============================================================
-// API: ADMIN ADD BULK KEYS
-// ============================================================
-app.post('/api/admin/add-bulk-keys', verifyAdmin, async (req, res) => {
-    const { userId, count = 1, days = 0, hours = 0, minutes = 0, lockToIp = null } = req.body;
-    
-    if (!userId) {
-        return res.json({ success: false, error: 'User ID required' });
-    }
-    
-    if (count > 100) {
-        return res.json({ success: false, error: 'Max 100 keys at once' });
-    }
-    
-    const totalHours = days * 24 + hours + minutes / 60;
-    const expiryMs = Date.now() + (totalHours * 3600000);
-    const keys = [];
-    
-    for (let i = 0; i < count; i++) {
-        const newKey = generateKey();
+    try {
+        const { 
+            userId, 
+            keyText, 
+            days = 0, 
+            hours = 0, 
+            minutes = 0, 
+            lockToIp = null 
+        } = req.body;
+        
+        if (!userId) {
+            return res.json({ success: false, error: 'User ID required' });
+        }
+        
+        const totalHours = days * 24 + hours + minutes / 60;
+        if (totalHours <= 0) {
+            return res.json({ success: false, error: 'Duration must be greater than 0' });
+        }
+        
+        const expiryMs = Date.now() + (totalHours * 3600000);
+        const newKey = keyText || generateKey();
+        
+        // Process IP Lock based on value
+        let finalLockIp = null;
+        let lockMessage = '';
+        
+        if (lockToIp === '0.0.0.0') {
+            // NO LOCK - can be used from any IP
+            finalLockIp = '0.0.0.0';
+            lockMessage = 'No IP lock (any IP can use)';
+        } else if (lockToIp === null || lockToIp === '') {
+            // AUTO LOCK - will lock to first IP that uses it
+            finalLockIp = null;
+            lockMessage = 'Auto-lock on first use';
+        } else {
+            // CUSTOM IP LOCK - lock to specific IP
+            finalLockIp = lockToIp;
+            lockMessage = `Locked to IP: ${lockToIp}`;
+        }
+        
         const { error } = await supabase
             .from('keys')
             .insert({
@@ -732,22 +698,131 @@ app.post('/api/admin/add-bulk-keys', verifyAdmin, async (req, res) => {
                 status: 'active',
                 is_admin_key: 1,
                 created_by: 'admin',
-                locked_ip: lockToIp || null
+                locked_ip: finalLockIp
             });
         
-        if (!error) {
-            keys.push(newKey);
+        if (error) {
+            return res.json({ success: false, error: error.message });
         }
+        
+        // Update user key count
+        const { data: user } = await supabase
+            .from('users')
+            .select('keys_generated')
+            .eq('user_id', userId)
+            .maybeSingle();
+        
+        if (user) {
+            await supabase
+                .from('users')
+                .update({ keys_generated: (user.keys_generated || 0) + 1 })
+                .eq('user_id', userId);
+        } else {
+            await supabase
+                .from('users')
+                .insert({
+                    user_id: userId,
+                    keys_generated: 1,
+                    created_at: Date.now()
+                });
+        }
+        
+        res.json({ 
+            success: true, 
+            key: newKey, 
+            expiryMs: expiryMs,
+            expiryFormatted: new Date(expiryMs).toLocaleString(),
+            lockedIp: finalLockIp === '0.0.0.0' ? 'No Lock' : (finalLockIp || 'Auto-lock'),
+            message: `✅ Key created! ${lockMessage}`
+        });
+        
+    } catch (err) {
+        console.error('Add key error:', err);
+        res.json({ success: false, error: err.message });
     }
-    
-    res.json({ 
-        success: true, 
-        keys: keys,
-        count: keys.length,
-        expiryMs: expiryMs,
-        expiryFormatted: new Date(expiryMs).toLocaleString(),
-        lockedIp: lockToIp || 'auto (first use)'
-    });
+});
+
+// ============================================================
+// API: ADMIN ADD BULK KEYS
+// ============================================================
+app.post('/api/admin/add-bulk-keys', verifyAdmin, async (req, res) => {
+    try {
+        const { 
+            userId, 
+            count = 1, 
+            days = 0, 
+            hours = 0, 
+            minutes = 0, 
+            lockToIp = null 
+        } = req.body;
+        
+        if (!userId) {
+            return res.json({ success: false, error: 'User ID required' });
+        }
+        
+        if (count > 100) {
+            return res.json({ success: false, error: 'Max 100 keys at once' });
+        }
+        
+        const totalHours = days * 24 + hours + minutes / 60;
+        const expiryMs = Date.now() + (totalHours * 3600000);
+        const keys = [];
+        
+        // Process IP Lock based on value
+        let finalLockIp = null;
+        if (lockToIp === '0.0.0.0') {
+            finalLockIp = '0.0.0.0';
+        } else if (lockToIp === null || lockToIp === '') {
+            finalLockIp = null;
+        } else {
+            finalLockIp = lockToIp;
+        }
+        
+        for (let i = 0; i < count; i++) {
+            const newKey = generateKey();
+            const { error } = await supabase
+                .from('keys')
+                .insert({
+                    key_text: newKey,
+                    user_id: userId,
+                    duration_hours: totalHours,
+                    duration_days: days,
+                    duration_minutes: minutes,
+                    expiry_ms: expiryMs,
+                    created_at: Date.now(),
+                    status: 'active',
+                    is_admin_key: 1,
+                    created_by: 'admin',
+                    locked_ip: finalLockIp
+                });
+            
+            if (!error) {
+                keys.push(newKey);
+            }
+        }
+        
+        let lockMessage = '';
+        if (finalLockIp === '0.0.0.0') {
+            lockMessage = 'No IP lock (any IP can use)';
+        } else if (finalLockIp === null) {
+            lockMessage = 'Auto-lock on first use';
+        } else {
+            lockMessage = `Locked to IP: ${finalLockIp}`;
+        }
+        
+        res.json({ 
+            success: true, 
+            keys: keys,
+            count: keys.length,
+            expiryMs: expiryMs,
+            expiryFormatted: new Date(expiryMs).toLocaleString(),
+            message: `✅ Generated ${keys.length} keys! ${lockMessage}`
+        });
+        
+    } catch (err) {
+        console.error('Bulk keys error:', err);
+        res.json({ success: false, error: err.message });
+    }
 });
 
 // ============================================================
@@ -898,15 +973,6 @@ app.post('/api/unban-myself', async (req, res) => {
 // ============================================================
 app.get('/api/health', (req, res) => {
     res.json({ status: 'healthy', timestamp: new Date().toISOString() });
-});
-
-// ============================================================
-// REDIRECT ROOT TO MAIN WEBSITE
-// ============================================================
-const MAIN_WEBSITE_URL = process.env.MAIN_WEBSITE_URL || "https://nexusofc-generate-key.vercel.app";
-
-app.get('/', (req, res) => {
-    res.redirect(MAIN_WEBSITE_URL);
 });
 
 // ============================================================
