@@ -23,36 +23,8 @@ const ADMIN_PASSWORD = "67";
 let adminToken = null;
 
 // ============================================================
-// DEVICE FINGERPRINTING
+// HELPER FUNCTIONS
 // ============================================================
-function getUltraSecureDeviceFingerprint(req) {
-    // Collect ALL available browser/device information
-    const userAgent = req.headers['user-agent'] || 'unknown';
-    const acceptLanguage = req.headers['accept-language'] || 'unknown';
-    const acceptEncoding = req.headers['accept-encoding'] || 'unknown';
-    const secChUa = req.headers['sec-ch-ua'] || 'unknown';
-    const secChUaPlatform = req.headers['sec-ch-ua-platform'] || 'unknown';
-    const secChUaMobile = req.headers['sec-ch-ua-mobile'] || 'unknown';
-    const secChUaFullVersion = req.headers['sec-ch-ua-full-version'] || 'unknown';
-    
-    // Create a unique fingerprint using multiple data points
-    const fingerprintData = [
-        userAgent,
-        acceptLanguage,
-        acceptEncoding,
-        secChUa,
-        secChUaPlatform,
-        secChUaMobile,
-        secChUaFullVersion,
-        req.ip || 'unknown'
-    ].join('|');
-    
-    // Use SHA-512 for maximum security
-    const deviceId = crypto.createHash('sha512').update(fingerprintData).digest('hex');
-    
-    return deviceId;
-}
-
 function generateKey() {
     const prefix = "NX";
     const timestamp = Date.now().toString(36).toUpperCase();
@@ -166,12 +138,12 @@ app.post('/api/start', async (req, res) => {
     try {
         const { userId } = req.body;
         const ip = getClientIp(req);
-        const deviceId = getUltraSecureDeviceFingerprint(req);
         
         if (!userId) {
             return res.json({ success: false, error: 'User ID required' });
         }
         
+        // Check if user already has active key
         const { data: existingKey } = await supabase
             .from('keys')
             .select('*')
@@ -189,6 +161,7 @@ app.post('/api/start', async (req, res) => {
             });
         }
         
+        // Create or get user
         let { data: user } = await supabase
             .from('users')
             .select('*')
@@ -201,7 +174,6 @@ app.post('/api/start', async (req, res) => {
                 .insert({
                     user_id: userId,
                     ip_address: ip,
-                    device_id: deviceId,
                     created_at: Date.now()
                 })
                 .select()
@@ -314,13 +286,11 @@ app.post('/api/step2', async (req, res) => {
 });
 
 // ============================================================
-// API: CLAIM KEY (USER CLAIMED - 1 DEVICE ONLY)
+// API: CLAIM KEY (USER CLAIMED - NO IP LOCK YET)
 // ============================================================
 app.post('/api/claim', async (req, res) => {
     try {
         const { userId, durationHours = 3 } = req.body;
-        const ip = getClientIp(req);
-        const deviceId = getUltraSecureDeviceFingerprint(req);
         
         if (!userId) {
             return res.json({ success: false, error: 'User ID required' });
@@ -358,7 +328,7 @@ app.post('/api/claim', async (req, res) => {
         const newKey = generateKey();
         const expiryMs = Date.now() + (durationHours * 3600000);
         
-        // USER KEY: is_admin_key = 0, max_devices = 1
+        // USER KEY: is_admin_key = 0, locked_ip = NULL (will be locked on first use)
         const { error: insertError } = await supabase
             .from('keys')
             .insert({
@@ -370,9 +340,7 @@ app.post('/api/claim', async (req, res) => {
                 status: 'active',
                 is_admin_key: 0,
                 created_by: 'user',
-                max_devices: 1,
-                current_devices: 0,
-                locked_device: null
+                locked_ip: null  // Not locked yet - will lock on first use
             });
         
         if (insertError) {
@@ -394,8 +362,7 @@ app.post('/api/claim', async (req, res) => {
             duration: durationHours,
             expiryMs: expiryMs,
             expiryFormatted: new Date(expiryMs).toLocaleString(),
-            maxDevices: 1,
-            message: `🔒 Key generated! This key is locked to your device and can only be used on 1 device.`
+            message: `🔓 Key generated! This key will be locked to the first IP that uses it.`
         });
         
     } catch (err) {
@@ -466,8 +433,7 @@ app.get('/api/my-key/:userId', async (req, res) => {
             expiryMs: keyData.expiry_ms,
             remaining: formatTimeRemaining(keyData.expiry_ms),
             isAdminKey: keyData.is_admin_key === 1,
-            maxDevices: keyData.max_devices || 1,
-            currentDevices: keyData.current_devices || 0
+            lockedIp: keyData.locked_ip || 'Not locked yet'
         });
         
     } catch (err) {
@@ -476,19 +442,18 @@ app.get('/api/my-key/:userId', async (req, res) => {
 });
 
 // ============================================================
-// API: VERIFY KEY (ULTRA SECURE DEVICE LOCK)
+// API: VERIFY KEY (AUTO IP LOCK ON FIRST USE)
 // ============================================================
 app.post('/api/verify-key', async (req, res) => {
     try {
         const { key } = req.body;
-        const deviceId = getUltraSecureDeviceFingerprint(req);
-        const ip = getClientIp(req);
+        const userIp = getClientIp(req);
         
         if (!key) {
             return res.json({ valid: false, error: 'Key is required' });
         }
         
-        console.log(`🔍 [VERIFY] Key: ${key}, Device: ${deviceId.substring(0, 16)}..., IP: ${ip}`);
+        console.log(`🔍 [VERIFY] Key: ${key}, IP: ${userIp}`);
         
         const { data: keyData, error } = await supabase
             .from('keys')
@@ -509,69 +474,20 @@ app.post('/api/verify-key', async (req, res) => {
             return res.json({ valid: false, error: 'Key has expired' });
         }
         
-        const deviceLockEnabled = await getSetting('device_lock_enabled', 'true');
-        const maxDevices = keyData.max_devices || 1;
-        const currentDevices = keyData.current_devices || 0;
+        // ============================================================
+        // AUTO IP LOCK LOGIC:
+        // - If key has no locked_ip yet → lock it to current IP (first use)
+        // - If key has locked_ip → check if matches current IP
+        // ============================================================
         
-        // Parse locked devices (stored as comma-separated string)
-        let lockedDevices = [];
-        if (keyData.locked_device) {
-            lockedDevices = keyData.locked_device.split(',');
-        }
-        
-        console.log(`📊 [DEVICE] Max: ${maxDevices}, Current: ${currentDevices}, Locked: ${lockedDevices.length}`);
-        
-        // Check if this device already has access
-        const isExistingDevice = lockedDevices.includes(deviceId);
-        
-        if (isExistingDevice) {
-            console.log(`✅ [SUCCESS] Device already registered: ${deviceId.substring(0, 16)}...`);
-            
-            // Record usage
-            await supabase
-                .from('key_usage')
-                .insert({
-                    key_text: key,
-                    device_id: deviceId,
-                    used_at: Date.now(),
-                    user_agent: req.headers['user-agent'],
-                    ip_address: ip
-                });
-            
-            return res.json({
-                valid: true,
-                key: keyData.key_text,
-                duration: keyData.duration_hours,
-                expiryMs: keyData.expiry_ms,
-                remaining: formatTimeRemaining(keyData.expiry_ms),
-                maxDevices: maxDevices,
-                currentDevices: currentDevices,
-                isExistingDevice: true,
-                message: `✅ Key valid! Your device is already registered.`
-            });
-        }
-        
-        // Check device lock
-        if (deviceLockEnabled === 'true') {
-            if (currentDevices >= maxDevices) {
-                console.log(`❌ [BLOCKED] Device limit reached: ${currentDevices}/${maxDevices}`);
-                return res.json({ 
-                    valid: false, 
-                    error: `🔒 This key has reached its maximum device limit (${currentDevices}/${maxDevices} devices). Cannot register new device.`
-                });
-            }
-            
-            // Add new device
-            const newLockedDevices = lockedDevices.length === 0 ? deviceId : [...lockedDevices, deviceId].join(',');
-            const newCurrentDevices = currentDevices + 1;
-            
-            console.log(`➕ [NEW DEVICE] Adding device. New count: ${newCurrentDevices}/${maxDevices}`);
+        if (!keyData.locked_ip) {
+            // First time using this key - LOCK IT to this IP
+            console.log(`🔒 Locking key ${key} to IP: ${userIp}`);
             
             await supabase
                 .from('keys')
                 .update({ 
-                    locked_device: newLockedDevices,
-                    current_devices: newCurrentDevices,
+                    locked_ip: userIp,
                     used_at: Date.now()
                 })
                 .eq('key_text', key);
@@ -581,36 +497,10 @@ app.post('/api/verify-key', async (req, res) => {
                 .from('key_usage')
                 .insert({
                     key_text: key,
-                    device_id: deviceId,
+                    device_id: userIp,
                     used_at: Date.now(),
                     user_agent: req.headers['user-agent'],
-                    ip_address: ip
-                });
-            
-            const remainingSlots = maxDevices - newCurrentDevices;
-            const slotMessage = remainingSlots > 0 ? `${remainingSlots} slot(s) remaining` : 'No more slots available';
-            
-            return res.json({
-                valid: true,
-                key: keyData.key_text,
-                duration: keyData.duration_hours,
-                expiryMs: keyData.expiry_ms,
-                remaining: formatTimeRemaining(keyData.expiry_ms),
-                maxDevices: maxDevices,
-                currentDevices: newCurrentDevices,
-                isNewDevice: true,
-                message: `✅ Key valid! New device registered (${newCurrentDevices}/${maxDevices}). ${slotMessage}`
-            });
-        } else {
-            // Device lock disabled
-            await supabase
-                .from('key_usage')
-                .insert({
-                    key_text: key,
-                    device_id: deviceId,
-                    used_at: Date.now(),
-                    user_agent: req.headers['user-agent'],
-                    ip_address: ip
+                    ip_address: userIp
                 });
             
             return res.json({
@@ -619,9 +509,43 @@ app.post('/api/verify-key', async (req, res) => {
                 duration: keyData.duration_hours,
                 expiryMs: keyData.expiry_ms,
                 remaining: formatTimeRemaining(keyData.expiry_ms),
-                message: `✅ Key valid! (Device lock is disabled)`
+                lockedIp: userIp,
+                message: `✅ Key locked to your IP: ${userIp}. This key can only be used from this IP address.`
             });
         }
+        
+        // Key already has locked_ip - check if matches
+        if (keyData.locked_ip !== userIp) {
+            console.log(`❌ [BLOCKED] IP mismatch. Key locked to: ${keyData.locked_ip}, Request from: ${userIp}`);
+            return res.json({ 
+                valid: false, 
+                error: `🔒 This key is locked to IP: ${keyData.locked_ip}. Your IP: ${userIp}. Access denied.`
+            });
+        }
+        
+        // Same IP - allowed
+        console.log(`✅ [SUCCESS] IP matches: ${userIp}`);
+        
+        // Record usage
+        await supabase
+            .from('key_usage')
+            .insert({
+                key_text: key,
+                device_id: userIp,
+                used_at: Date.now(),
+                user_agent: req.headers['user-agent'],
+                ip_address: userIp
+            });
+        
+        return res.json({
+            valid: true,
+            key: keyData.key_text,
+            duration: keyData.duration_hours,
+            expiryMs: keyData.expiry_ms,
+            remaining: formatTimeRemaining(keyData.expiry_ms),
+            lockedIp: keyData.locked_ip,
+            message: `✅ Key valid! (Locked to IP: ${keyData.locked_ip})`
+        });
         
     } catch (err) {
         console.error('Verify key error:', err);
@@ -703,10 +627,10 @@ app.post('/api/admin/users', verifyAdmin, async (req, res) => {
 });
 
 // ============================================================
-// API: ADMIN ADD KEY (WITH CUSTOM MAX DEVICES)
+// API: ADMIN ADD KEY (WITH OPTIONAL IP LOCK)
 // ============================================================
 app.post('/api/admin/add-key', verifyAdmin, async (req, res) => {
-    const { userId, keyText, days = 0, hours = 0, minutes = 0, maxDevices = 999 } = req.body;
+    const { userId, keyText, days = 0, hours = 0, minutes = 0, lockToIp = null } = req.body;
     
     if (!userId) {
         return res.json({ success: false, error: 'User ID required' });
@@ -720,6 +644,7 @@ app.post('/api/admin/add-key', verifyAdmin, async (req, res) => {
     const expiryMs = Date.now() + (totalHours * 3600000);
     const newKey = keyText || generateKey();
     
+    // ADMIN KEY: is_admin_key = 1, can set custom IP lock or leave null
     const { error } = await supabase
         .from('keys')
         .insert({
@@ -733,15 +658,14 @@ app.post('/api/admin/add-key', verifyAdmin, async (req, res) => {
             status: 'active',
             is_admin_key: 1,
             created_by: 'admin',
-            max_devices: maxDevices,
-            current_devices: 0,
-            locked_device: null
+            locked_ip: lockToIp || null  // Can be specific IP or null (auto-lock on first use)
         });
     
     if (error) {
         return res.json({ success: false, error: error.message });
     }
     
+    // Update user key count
     const { data: user } = await supabase
         .from('users')
         .select('keys_generated')
@@ -763,13 +687,15 @@ app.post('/api/admin/add-key', verifyAdmin, async (req, res) => {
             });
     }
     
+    const lockMessage = lockToIp ? `Locked to IP: ${lockToIp}` : 'Will be locked to first IP that uses it';
+    
     res.json({ 
         success: true, 
         key: newKey, 
         expiryMs: expiryMs,
         expiryFormatted: new Date(expiryMs).toLocaleString(),
-        maxDevices: maxDevices,
-        message: maxDevices >= 999 ? `✅ Key created! Can be used on unlimited devices.` : `✅ Key created! Can be used on ${maxDevices} device(s).`
+        lockedIp: lockToIp || 'auto (first use)',
+        message: `✅ Key created! ${lockMessage}`
     });
 });
 
@@ -777,7 +703,7 @@ app.post('/api/admin/add-key', verifyAdmin, async (req, res) => {
 // API: ADMIN ADD BULK KEYS
 // ============================================================
 app.post('/api/admin/add-bulk-keys', verifyAdmin, async (req, res) => {
-    const { userId, count = 1, days = 0, hours = 0, minutes = 0, maxDevices = 999 } = req.body;
+    const { userId, count = 1, days = 0, hours = 0, minutes = 0, lockToIp = null } = req.body;
     
     if (!userId) {
         return res.json({ success: false, error: 'User ID required' });
@@ -806,9 +732,7 @@ app.post('/api/admin/add-bulk-keys', verifyAdmin, async (req, res) => {
                 status: 'active',
                 is_admin_key: 1,
                 created_by: 'admin',
-                max_devices: maxDevices,
-                current_devices: 0,
-                locked_device: null
+                locked_ip: lockToIp || null
             });
         
         if (!error) {
@@ -822,7 +746,7 @@ app.post('/api/admin/add-bulk-keys', verifyAdmin, async (req, res) => {
         count: keys.length,
         expiryMs: expiryMs,
         expiryFormatted: new Date(expiryMs).toLocaleString(),
-        maxDevices: maxDevices
+        lockedIp: lockToIp || 'auto (first use)'
     });
 });
 
@@ -930,10 +854,10 @@ app.post('/api/admin/get-settings', verifyAdmin, async (req, res) => {
 // API: ADMIN SAVE SETTINGS
 // ============================================================
 app.post('/api/admin/settings', verifyAdmin, async (req, res) => {
-    const { device_lock_enabled, max_keys_per_user, cooldown_minutes, default_duration_hours } = req.body;
+    const { ip_lock_enabled, max_keys_per_user, cooldown_minutes, default_duration_hours } = req.body;
     
-    if (device_lock_enabled !== undefined) {
-        await supabase.from('settings').upsert({ key: 'device_lock_enabled', value: device_lock_enabled, updated_at: Date.now() });
+    if (ip_lock_enabled !== undefined) {
+        await supabase.from('settings').upsert({ key: 'ip_lock_enabled', value: ip_lock_enabled, updated_at: Date.now() });
     }
     if (max_keys_per_user !== undefined) {
         await supabase.from('settings').upsert({ key: 'max_keys_per_user', value: max_keys_per_user.toString(), updated_at: Date.now() });
