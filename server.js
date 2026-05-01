@@ -5,7 +5,7 @@ const rateLimit = require('express-rate-limit');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(cors({ origin: '*', credentials: true }));
+app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
@@ -40,6 +40,19 @@ async function isMaintenanceMode() {
     }
 }
 
+async function getMaintenanceMessage() {
+    try {
+        const { data } = await supabase
+            .from('system_settings')
+            .select('value')
+            .eq('key', 'maintenance_message')
+            .single();
+        return data?.value || 'Server is under maintenance. Please come back later.';
+    } catch (error) {
+        return 'Server is under maintenance. Please come back later.';
+    }
+}
+
 // ============================================================
 // MAINTENANCE MIDDLEWARE
 // ============================================================
@@ -50,10 +63,11 @@ app.use('/api/', async (req, res, next) => {
     
     const maintenance = await isMaintenanceMode();
     if (maintenance) {
+        const message = await getMaintenanceMessage();
         return res.status(503).json({
             success: false,
             maintenance: true,
-            message: 'Server is under maintenance',
+            message: message,
             error: 'Service temporarily unavailable'
         });
     }
@@ -125,35 +139,205 @@ function getClientIp(req) {
            'unknown';
 }
 
+async function isIpBanned(ip) {
+    if (!ip || ip === 'unknown') return false;
+    const { data } = await supabase
+        .from('ip_blacklist')
+        .select('ip_address')
+        .eq('ip_address', ip)
+        .maybeSingle();
+    return !!data;
+}
+
+async function isDeviceBanned(deviceFingerprint) {
+    if (!deviceFingerprint) return false;
+    const { data } = await supabase
+        .from('device_blacklist')
+        .select('device_fingerprint')
+        .eq('device_fingerprint', deviceFingerprint)
+        .maybeSingle();
+    return !!data;
+}
+
 async function getSetting(key, defaultValue = 'false') {
-    try {
-        const { data } = await supabase
-            .from('settings')
-            .select('value')
-            .eq('key', key)
-            .maybeSingle();
-        return data?.value || defaultValue;
-    } catch (error) {
-        return defaultValue;
-    }
+    const { data } = await supabase
+        .from('settings')
+        .select('value')
+        .eq('key', key)
+        .maybeSingle();
+    return data?.value || defaultValue;
 }
 
 async function logSecurityEvent(eventType, details, ip, deviceFp, userId = null) {
-    try {
-        await supabase.from('security_logs').insert({
-            event_type: eventType,
-            details: details,
+    await supabase.from('security_logs').insert({
+        event_type: eventType,
+        details: details,
+        ip_address: ip,
+        device_fingerprint: deviceFp,
+        user_id: userId,
+        timestamp: Date.now()
+    });
+}
+
+async function incrementFailedAttempts(ip, deviceFp, key = null) {
+    const today = new Date().toISOString().split('T')[0];
+    
+    const { data: record } = await supabase
+        .from('failed_attempts')
+        .select('attempts, id')
+        .eq('ip_address', ip)
+        .eq('date', today)
+        .maybeSingle();
+    
+    let newAttempts = 1;
+    
+    if (record) {
+        newAttempts = record.attempts + 1;
+        await supabase
+            .from('failed_attempts')
+            .update({ attempts: newAttempts, last_key: key, device_fingerprint: deviceFp })
+            .eq('id', record.id);
+    } else {
+        await supabase.from('failed_attempts').insert({
             ip_address: ip,
             device_fingerprint: deviceFp,
-            user_id: userId,
-            timestamp: Date.now()
+            date: today,
+            attempts: 1,
+            last_key: key
         });
-    } catch (error) {}
+    }
+    
+    if (newAttempts >= 10) {
+        await supabase.from('ip_blacklist').insert({
+            ip_address: ip,
+            reason: `Auto-ban: ${newAttempts} failed key attempts in one day`,
+            banned_at: Date.now()
+        });
+        await logSecurityEvent('AUTO_BAN', `IP auto-banned after ${newAttempts} failed attempts`, ip, deviceFp);
+        return true;
+    }
+    return false;
 }
 
 // ============================================================
-// VERIFY ADMIN MIDDLEWARE
+// DEVICE LIMIT FUNCTIONS
 // ============================================================
+
+async function registerDevice(keyText, deviceFingerprint, req) {
+    const now = Date.now();
+    const deviceName = req.headers['sec-ch-ua'] || req.headers['user-agent']?.substring(0, 100) || 'Unknown Device';
+    
+    // Cek apakah device sudah terdaftar
+    const { data: existing } = await supabase
+        .from('key_devices')
+        .select('*')
+        .eq('key_text', keyText)
+        .eq('device_fingerprint', deviceFingerprint)
+        .maybeSingle();
+    
+    if (existing) {
+        await supabase
+            .from('key_devices')
+            .update({ last_seen: now, ip_address: getClientIp(req), user_agent: req.headers['user-agent'] })
+            .eq('id', existing.id);
+        return { success: true, isNew: false };
+    }
+    
+    // Cek jumlah device saat ini
+    const { count: currentDevices } = await supabase
+        .from('key_devices')
+        .select('*', { count: 'exact', head: true })
+        .eq('key_text', keyText)
+        .eq('is_active', true);
+    
+    // Ambil max devices dari key
+    const { data: keyData } = await supabase
+        .from('keys')
+        .select('max_devices')
+        .eq('key_text', keyText)
+        .single();
+    
+    const maxDevices = keyData?.max_devices || parseInt(await getSetting('default_max_devices', '1'));
+    
+    if (currentDevices >= maxDevices) {
+        return { success: false, error: `Maximum ${maxDevices} device(s) allowed for this key.` };
+    }
+    
+    // Register device baru
+    await supabase.from('key_devices').insert({
+        key_text: keyText,
+        device_fingerprint: deviceFingerprint,
+        device_name: deviceName,
+        ip_address: getClientIp(req),
+        user_agent: req.headers['user-agent'],
+        first_seen: now,
+        last_seen: now,
+        is_active: true
+    });
+    
+    await supabase
+        .from('keys')
+        .update({ current_devices: currentDevices + 1 })
+        .eq('key_text', keyText);
+    
+    return { success: true, isNew: true, currentDevices: currentDevices + 1, maxDevices: maxDevices };
+}
+
+async function getKeyDevices(keyText) {
+    const { data: devices } = await supabase
+        .from('key_devices')
+        .select('*')
+        .eq('key_text', keyText)
+        .eq('is_active', true)
+        .order('first_seen', { ascending: false });
+    
+    return devices || [];
+}
+
+// ============================================================
+// AUTO DELETE EXPIRED KEYS
+// ============================================================
+async function deleteExpiredKeys() {
+    try {
+        const now = Date.now();
+        
+        await supabase
+            .from('keys')
+            .update({ status: 'expired' })
+            .lt('expiry_ms', now)
+            .eq('status', 'active');
+        
+        await supabase
+            .from('key_sessions')
+            .update({ is_active: false })
+            .lt('expires_at', now)
+            .eq('is_active', true);
+        
+    } catch (err) {
+        console.error('Auto delete error:', err);
+    }
+}
+
+setInterval(async () => {
+    await deleteExpiredKeys();
+}, 3600000);
+
+setTimeout(async () => {
+    await deleteExpiredKeys();
+}, 5000);
+
+// ============================================================
+// MIDDLEWARE
+// ============================================================
+async function checkIpBan(req, res, next) {
+    const ip = getClientIp(req);
+    const banned = await isIpBanned(ip);
+    if (banned) {
+        return res.status(403).json({ success: false, error: 'Your IP has been banned' });
+    }
+    next();
+}
+
 function verifyAdmin(req, res, next) {
     const token = req.body.token || req.query.token;
     if (!token || token !== adminToken || (adminTokenExpiry && Date.now() > adminTokenExpiry)) {
@@ -162,17 +346,7 @@ function verifyAdmin(req, res, next) {
     next();
 }
 
-// ============================================================
-// API: HEALTH CHECK
-// ============================================================
-app.get('/api/health', (req, res) => {
-    res.json({ status: 'healthy', timestamp: new Date().toISOString() });
-});
-
-app.get('/api/maintenance-status', async (req, res) => {
-    const maintenance = await isMaintenanceMode();
-    res.json({ success: true, maintenance: maintenance, message: 'Server status' });
-});
+app.use('/api/', checkIpBan);
 
 // ============================================================
 // API: START CHALLENGE
@@ -183,23 +357,6 @@ app.post('/api/start', async (req, res) => {
         const ip = getClientIp(req);
         
         if (!userId) return res.json({ success: false, error: 'User ID required' });
-        
-        const { data: existingKey } = await supabase
-            .from('keys')
-            .select('*')
-            .eq('user_id', userId)
-            .eq('status', 'active')
-            .gt('expiry_ms', Date.now())
-            .maybeSingle();
-        
-        if (existingKey) {
-            return res.json({ 
-                success: false, 
-                error: 'You already have an active key',
-                key: existingKey.key_text,
-                expiry: formatTimeRemaining(existingKey.expiry_ms)
-            });
-        }
         
         let { data: user } = await supabase
             .from('users')
@@ -222,7 +379,6 @@ app.post('/api/start', async (req, res) => {
         
         res.json({ 
             success: true, 
-            message: 'Challenge started!',
             step1_completed: user.step1_completed || 0,
             step2_completed: user.step2_completed || 0
         });
@@ -341,8 +497,9 @@ app.post('/api/claim', async (req, res) => {
         
         const newKey = generateKey();
         const expiryMs = Date.now() + (durationHours * 3600000);
+        const defaultMaxDevices = parseInt(await getSetting('default_max_devices', '1'));
         
-        const { error: insertError } = await supabase.from('keys').insert({
+        await supabase.from('keys').insert({
             key_text: newKey,
             user_id: userId,
             duration_hours: durationHours,
@@ -352,13 +509,10 @@ app.post('/api/claim', async (req, res) => {
             is_admin_key: 0,
             created_by: 'user',
             locked_ip: ip,
-            max_devices: 1,
-            current_devices: 0
+            max_devices: defaultMaxDevices,
+            current_devices: 0,
+            binding_type: 'device'
         });
-        
-        if (insertError) {
-            return res.json({ success: false, error: insertError.message });
-        }
         
         await supabase
             .from('users')
@@ -382,7 +536,8 @@ app.post('/api/claim', async (req, res) => {
             duration: durationHours,
             expiryMs: expiryMs,
             expiryFormatted: new Date(expiryMs).toLocaleString(),
-            message: '🔓 Key generated!'
+            maxDevices: defaultMaxDevices,
+            message: `🔓 Key generated! Can be used on ${defaultMaxDevices} device(s).`
         });
         
     } catch (err) {
@@ -391,15 +546,23 @@ app.post('/api/claim', async (req, res) => {
 });
 
 // ============================================================
-// API: VERIFY KEY
+// API: VERIFY KEY (DENGAN DEVICE LIMIT)
 // ============================================================
 app.post('/api/verify-key', async (req, res) => {
     try {
         const { key, sessionToken } = req.body;
         const userIp = getClientIp(req);
+        const deviceFp = generateDeviceFingerprint(req);
         
         if (!key) return res.json({ valid: false, error: 'Key is required' });
         
+        // Check device ban
+        const deviceBanned = await isDeviceBanned(deviceFp);
+        if (deviceBanned) {
+            return res.json({ valid: false, error: 'Your device has been banned' });
+        }
+        
+        // Get key data
         const { data: keyData } = await supabase
             .from('keys')
             .select('*')
@@ -407,9 +570,11 @@ app.post('/api/verify-key', async (req, res) => {
             .single();
         
         if (!keyData) {
+            await incrementFailedAttempts(userIp, deviceFp, key);
             return res.json({ valid: false, error: 'Key not found' });
         }
         
+        // Check expiry
         if (Date.now() > keyData.expiry_ms) {
             await supabase.from('keys').update({ status: 'expired' }).eq('key_text', key);
             return res.json({ valid: false, error: 'Key has expired' });
@@ -419,7 +584,7 @@ app.post('/api/verify-key', async (req, res) => {
             return res.json({ valid: false, error: 'Key is not active' });
         }
         
-        // Check session
+        // Check session token
         if (sessionToken) {
             const { data: session } = await supabase
                 .from('key_sessions')
@@ -447,6 +612,13 @@ app.post('/api/verify-key', async (req, res) => {
             }
         }
         
+        // Check device limit
+        const deviceRegistration = await registerDevice(key, deviceFp, req);
+        if (!deviceRegistration.success) {
+            return res.json({ valid: false, error: deviceRegistration.error });
+        }
+        
+        // First time use - lock
         if (!keyData.locked_ip) {
             await supabase
                 .from('keys')
@@ -457,6 +629,7 @@ app.post('/api/verify-key', async (req, res) => {
             await supabase.from('key_sessions').insert({
                 key_text: key,
                 session_token: newSessionToken,
+                device_fingerprint: deviceFp,
                 ip_address: userIp,
                 created_at: Date.now(),
                 expires_at: keyData.expiry_ms,
@@ -470,7 +643,8 @@ app.post('/api/verify-key', async (req, res) => {
                 duration: keyData.duration_hours,
                 expiryMs: keyData.expiry_ms,
                 remaining: formatTimeRemaining(keyData.expiry_ms),
-                message: '✅ Key locked to your IP'
+                maxDevices: keyData.max_devices,
+                message: `✅ Key locked (${deviceRegistration.currentDevices || 1}/${keyData.max_devices} devices)`
             });
         }
         
@@ -521,7 +695,8 @@ app.get('/api/my-key/:userId', async (req, res) => {
             key: keyData.key_text,
             duration: keyData.duration_hours,
             expiryMs: keyData.expiry_ms,
-            remaining: formatTimeRemaining(keyData.expiry_ms)
+            remaining: formatTimeRemaining(keyData.expiry_ms),
+            maxDevices: keyData.max_devices
         });
         
     } catch (err) {
@@ -530,17 +705,29 @@ app.get('/api/my-key/:userId', async (req, res) => {
 });
 
 // ============================================================
+// API: MAINTENANCE STATUS
+// ============================================================
+app.get('/api/maintenance-status', async (req, res) => {
+    const maintenance = await isMaintenanceMode();
+    const message = await getMaintenanceMessage();
+    res.json({ success: true, maintenance: maintenance, message: message });
+});
+
+// ============================================================
+// API: HEALTH CHECK
+// ============================================================
+app.get('/api/health', (req, res) => {
+    res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+});
+
 // ============================================================
 // ADMIN API (LENGKAP)
-// ============================================================
 // ============================================================
 
 // ADMIN LOGIN
 app.post('/api/admin/login', async (req, res) => {
     const { username, password } = req.body;
     const ip = getClientIp(req);
-    
-    console.log(`Admin login attempt: ${username}`);
     
     if (username === 'admin' && password === ADMIN_PASSWORD) {
         adminToken = crypto.randomBytes(32).toString('hex');
@@ -553,49 +740,38 @@ app.post('/api/admin/login', async (req, res) => {
             timestamp: Date.now()
         });
         
-        console.log(`Admin login successful, token: ${adminToken.substring(0, 20)}...`);
         res.json({ success: true, token: adminToken, expiry: adminTokenExpiry });
     } else {
-        console.log(`Admin login failed for ${username}`);
         res.json({ success: false, error: 'Invalid credentials' });
     }
 });
 
 // ADMIN STATS
 app.post('/api/admin/stats', verifyAdmin, async (req, res) => {
-    try {
-        const { count: totalKeys } = await supabase.from('keys').select('*', { count: 'exact', head: true });
-        const { count: activeKeys } = await supabase.from('keys').select('*', { count: 'exact', head: true }).eq('status', 'active');
-        const { count: totalUsers } = await supabase.from('users').select('*', { count: 'exact', head: true });
-        const { count: totalDevices } = await supabase.from('key_devices').select('*', { count: 'exact', head: true }).eq('is_active', true);
-        
-        res.json({
-            success: true,
-            stats: {
-                totalKeys: totalKeys || 0,
-                activeKeys: activeKeys || 0,
-                totalUsers: totalUsers || 0,
-                totalDevices: totalDevices || 0
-            }
-        });
-    } catch (err) {
-        res.json({ success: false, error: err.message });
-    }
+    const { count: totalKeys } = await supabase.from('keys').select('*', { count: 'exact', head: true });
+    const { count: activeKeys } = await supabase.from('keys').select('*', { count: 'exact', head: true }).eq('status', 'active');
+    const { count: totalUsers } = await supabase.from('users').select('*', { count: 'exact', head: true });
+    const { count: totalDevices } = await supabase.from('key_devices').select('*', { count: 'exact', head: true }).eq('is_active', true);
+    
+    res.json({
+        success: true,
+        stats: {
+            totalKeys: totalKeys || 0,
+            activeKeys: activeKeys || 0,
+            totalUsers: totalUsers || 0,
+            totalDevices: totalDevices || 0
+        }
+    });
 });
 
 // ADMIN KEYS LIST
 app.post('/api/admin/keys', verifyAdmin, async (req, res) => {
-    try {
-        const { data: keys } = await supabase
-            .from('keys')
-            .select('*')
-            .order('created_at', { ascending: false })
-            .limit(500);
-        
-        res.json({ success: true, keys: keys || [] });
-    } catch (err) {
-        res.json({ success: false, error: err.message });
-    }
+    const { data: keys } = await supabase
+        .from('keys')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(500);
+    res.json({ success: true, keys: keys || [] });
 });
 
 // ADMIN ADD KEY
@@ -603,14 +779,12 @@ app.post('/api/admin/add-key', verifyAdmin, async (req, res) => {
     try {
         const { userId, hours = 3, keyText, maxDevices = 1 } = req.body;
         
-        if (!userId) {
-            return res.json({ success: false, error: 'User ID required' });
-        }
+        if (!userId) return res.json({ success: false, error: 'User ID required' });
         
         const expiryMs = Date.now() + (hours * 3600000);
         const newKey = keyText || generateKey();
         
-        const { error } = await supabase.from('keys').insert({
+        await supabase.from('keys').insert({
             key_text: newKey,
             user_id: userId,
             duration_hours: hours,
@@ -620,19 +794,12 @@ app.post('/api/admin/add-key', verifyAdmin, async (req, res) => {
             is_admin_key: 1,
             created_by: 'admin',
             max_devices: maxDevices,
-            current_devices: 0
+            current_devices: 0,
+            binding_type: 'device'
         });
         
-        if (error) {
-            return res.json({ success: false, error: error.message });
-        }
+        res.json({ success: true, key: newKey, expiryFormatted: new Date(expiryMs).toLocaleString(), maxDevices: maxDevices });
         
-        res.json({ 
-            success: true, 
-            key: newKey, 
-            expiryFormatted: new Date(expiryMs).toLocaleString(),
-            maxDevices: maxDevices
-        });
     } catch (err) {
         res.json({ success: false, error: err.message });
     }
@@ -640,15 +807,11 @@ app.post('/api/admin/add-key', verifyAdmin, async (req, res) => {
 
 // ADMIN DELETE KEY
 app.post('/api/admin/delete-key', verifyAdmin, async (req, res) => {
-    try {
-        const { key } = req.body;
-        await supabase.from('key_sessions').delete().eq('key_text', key);
-        await supabase.from('key_devices').delete().eq('key_text', key);
-        await supabase.from('keys').delete().eq('key_text', key);
-        res.json({ success: true });
-    } catch (err) {
-        res.json({ success: false, error: err.message });
-    }
+    const { key } = req.body;
+    await supabase.from('key_sessions').delete().eq('key_text', key);
+    await supabase.from('key_devices').delete().eq('key_text', key);
+    await supabase.from('keys').delete().eq('key_text', key);
+    res.json({ success: true });
 });
 
 // ADMIN GET SETTINGS
@@ -697,58 +860,40 @@ app.post('/api/admin/settings', verifyAdmin, async (req, res) => {
 
 // ADMIN MAINTENANCE SETTINGS
 app.post('/api/admin/maintenance/settings', verifyAdmin, async (req, res) => {
-    try {
-        const { data: settings } = await supabase
-            .from('system_settings')
-            .select('*')
-            .in('key', ['maintenance_mode', 'maintenance_message', 'maintenance_estimated_time']);
-        
-        const result = {};
-        if (settings) {
-            settings.forEach(s => { result[s.key] = s.value; });
+    const { data: settings } = await supabase
+        .from('system_settings')
+        .select('*')
+        .in('key', ['maintenance_mode', 'maintenance_message', 'maintenance_estimated_time']);
+    
+    const result = {};
+    settings?.forEach(s => { result[s.key] = s.value; });
+    
+    res.json({ 
+        success: true, 
+        settings: {
+            maintenance_mode: result.maintenance_mode || 'false',
+            maintenance_message: result.maintenance_message || 'Server is under maintenance',
+            maintenance_estimated_time: result.maintenance_estimated_time || '30 minutes'
         }
-        
-        res.json({ 
-            success: true, 
-            settings: {
-                maintenance_mode: result.maintenance_mode || 'false',
-                maintenance_message: result.maintenance_message || 'Server is under maintenance',
-                maintenance_estimated_time: result.maintenance_estimated_time || '30 minutes'
-            }
-        });
-    } catch (err) {
-        res.json({ success: false, error: err.message });
-    }
+    });
 });
 
 // ADMIN ENABLE MAINTENANCE
 app.post('/api/admin/maintenance/enable', verifyAdmin, async (req, res) => {
-    try {
-        const { message, estimatedTime } = req.body;
-        const now = Date.now();
-        
-        await supabase.from('system_settings').upsert({ key: 'maintenance_mode', value: 'true', updated_at: now, updated_by: 'admin' }, { onConflict: 'key' });
-        if (message) {
-            await supabase.from('system_settings').upsert({ key: 'maintenance_message', value: message, updated_at: now }, { onConflict: 'key' });
-        }
-        if (estimatedTime) {
-            await supabase.from('system_settings').upsert({ key: 'maintenance_estimated_time', value: estimatedTime, updated_at: now }, { onConflict: 'key' });
-        }
-        
-        res.json({ success: true, message: 'Maintenance mode enabled' });
-    } catch (err) {
-        res.json({ success: false, error: err.message });
-    }
+    const { message, estimatedTime } = req.body;
+    const now = Date.now();
+    
+    await supabase.from('system_settings').upsert({ key: 'maintenance_mode', value: 'true', updated_at: now, updated_by: 'admin' }, { onConflict: 'key' });
+    if (message) await supabase.from('system_settings').upsert({ key: 'maintenance_message', value: message, updated_at: now }, { onConflict: 'key' });
+    if (estimatedTime) await supabase.from('system_settings').upsert({ key: 'maintenance_estimated_time', value: estimatedTime, updated_at: now }, { onConflict: 'key' });
+    
+    res.json({ success: true, message: 'Maintenance mode enabled' });
 });
 
 // ADMIN DISABLE MAINTENANCE
 app.post('/api/admin/maintenance/disable', verifyAdmin, async (req, res) => {
-    try {
-        await supabase.from('system_settings').upsert({ key: 'maintenance_mode', value: 'false', updated_at: Date.now(), updated_by: 'admin' }, { onConflict: 'key' });
-        res.json({ success: true, message: 'Maintenance mode disabled' });
-    } catch (err) {
-        res.json({ success: false, error: err.message });
-    }
+    await supabase.from('system_settings').upsert({ key: 'maintenance_mode', value: 'false', updated_at: Date.now(), updated_by: 'admin' }, { onConflict: 'key' });
+    res.json({ success: true, message: 'Maintenance mode disabled' });
 });
 
 // ADMIN LOGOUT
@@ -765,8 +910,8 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
     console.log(`🚀 NEXUS SERVER running on port ${PORT}`);
-    console.log(`🔐 Admin login: admin / 67`);
-    console.log(`✅ All endpoints ready`);
+    console.log(`🔐 Admin login: admin / ${ADMIN_PASSWORD}`);
+    console.log(`📱 Device Limit: Enabled`);
 });
 
 module.exports = app;
