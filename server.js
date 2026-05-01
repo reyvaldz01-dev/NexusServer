@@ -415,41 +415,205 @@ app.post('/api/step2', async (req, res) => {
 
 app.post('/api/claim', async (req, res) => {
     try {
-        const { userId, durationHours = 3 } = req.body;
+        const { 
+            userId, 
+            durationHours = 3, 
+            days = 0, 
+            hours = 0, 
+            minutes = 0,
+            bindingType = 'device'
+        } = req.body;
+        
         const ip = getClientIp(req);
+        const deviceFp = generateDeviceFingerprint(req);
         
-        if (!userId) return res.json({ success: false, error: 'User ID required' });
+        // Validasi User ID
+        if (!userId) {
+            return res.json({ success: false, error: 'User ID required' });
+        }
         
-        const { data: user } = await supabase.from('users').select('*').eq('user_id', userId).single();
-        if (!user) return res.json({ success: false, error: 'User not found' });
+        // HITUNG TOTAL DURASI dengan benar
+        let totalHours = durationHours;
+        if (days > 0 || hours > 0 || minutes > 0) {
+            totalHours = (days * 24) + hours + (minutes / 60);
+        }
         
-        if (user.step2_completed !== 1) return res.json({ success: false, error: 'Complete both steps first!' });
-        if (user.reward_claimed === 1) return res.json({ success: false, error: 'Reward already claimed!' });
+        if (totalHours <= 0) {
+            return res.json({ success: false, error: 'Duration must be greater than 0' });
+        }
         
+        // Cek user
+        const { data: user, error: userError } = await supabase
+            .from('users')
+            .select('*')
+            .eq('user_id', userId)
+            .single();
+        
+        if (userError || !user) {
+            return res.json({ success: false, error: 'User not found' });
+        }
+        
+        // Cek step 2 sudah selesai
+        if (user.step2_completed !== 1) {
+            return res.json({ success: false, error: 'Complete both steps first!' });
+        }
+        
+        // Cek sudah pernah claim
+        if (user.reward_claimed === 1) {
+            return res.json({ success: false, error: 'Reward already claimed!' });
+        }
+        
+        // Cek limit key per user
         const maxKeysPerUser = parseInt(await getSetting('max_keys_per_user', '5'));
-        const { count: userKeys } = await supabase.from('keys').select('*', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'active');
-        if (userKeys >= maxKeysPerUser) return res.json({ success: false, error: `Maximum ${maxKeysPerUser} keys per user` });
+        const { count: userKeys, error: countError } = await supabase
+            .from('keys')
+            .select('*', { count: 'exact', head: true })
+            .eq('user_id', userId)
+            .eq('status', 'active');
         
+        if (countError) {
+            console.error('Count error:', countError);
+        }
+        
+        if (userKeys >= maxKeysPerUser) {
+            return res.json({ success: false, error: `Maximum ${maxKeysPerUser} keys per user` });
+        }
+        
+        // Generate key baru
         const newKey = generateKey();
-        const expiryMs = Date.now() + (durationHours * 3600000);
+        const expiryMs = Date.now() + (totalHours * 3600000);
         const defaultMaxDevices = parseInt(await getSetting('default_max_devices', '1'));
         
-        await supabase.from('keys').insert({
-            key_text: newKey, user_id: userId, duration_hours: durationHours, expiry_ms: expiryMs,
-            created_at: Date.now(), status: 'active', is_admin_key: 0, created_by: 'user',
-            locked_ip: ip, max_devices: defaultMaxDevices, current_devices: 0, binding_type: 'device'
-        });
+        // Set binding type
+        let lockedIp = null;
+        let lockedDeviceFp = null;
+        let bindingMessage = '';
         
-        await supabase.from('users').update({ reward_claimed: 1, keys_generated: (user.keys_generated || 0) + 1 }).eq('user_id', userId);
+        switch(bindingType) {
+            case 'ip':
+                lockedIp = ip;
+                bindingMessage = `Key will be bound to IP: ${ip}`;
+                break;
+            case 'device':
+                lockedDeviceFp = deviceFp;
+                bindingMessage = `Key will be bound to this device fingerprint`;
+                break;
+            case 'both':
+                lockedIp = ip;
+                lockedDeviceFp = deviceFp;
+                bindingMessage = `Key will be bound to both IP and device fingerprint`;
+                break;
+            case 'none':
+                lockedIp = '0.0.0.0';
+                bindingMessage = `Key is NOT bound (can be used from anywhere) - INSECURE`;
+                break;
+            default:
+                lockedDeviceFp = deviceFp;
+                bindingMessage = `Key will be bound to this device fingerprint`;
+        }
         
+        // Insert key ke database
+        const { error: insertError } = await supabase
+            .from('keys')
+            .insert({
+                key_text: newKey,
+                user_id: userId,
+                duration_hours: totalHours,
+                duration_days: days,
+                duration_minutes: minutes,
+                expiry_ms: expiryMs,
+                created_at: Date.now(),
+                status: 'active',
+                is_admin_key: 0,
+                created_by: 'user',
+                locked_ip: lockedIp,
+                locked_device_fingerprint: lockedDeviceFp,
+                binding_type: bindingType,
+                max_devices: defaultMaxDevices,
+                current_devices: 0,
+                used_count: 0
+            });
+        
+        if (insertError) {
+            console.error('Insert key error:', insertError);
+            return res.json({ success: false, error: insertError.message });
+        }
+        
+        // Register device pertama untuk key ini
+        try {
+            await supabase.from('key_devices').insert({
+                key_text: newKey,
+                device_fingerprint: deviceFp,
+                device_name: req.headers['user-agent']?.substring(0, 100) || 'Unknown Device',
+                ip_address: ip,
+                first_seen: Date.now(),
+                last_seen: Date.now(),
+                is_active: true
+            });
+            
+            await supabase
+                .from('keys')
+                .update({ current_devices: 1 })
+                .eq('key_text', newKey);
+        } catch (deviceError) {
+            console.error('Device register error:', deviceError);
+            // Tidak perlu return error, device register opsional
+        }
+        
+        // Update user
+        await supabase
+            .from('users')
+            .update({ 
+                reward_claimed: 1, 
+                keys_generated: (user.keys_generated || 0) + 1
+            })
+            .eq('user_id', userId);
+        
+        // Generate session token
         const sessionToken = generateSessionToken();
-        await supabase.from('key_sessions').insert({
-            key_text: newKey, session_token: sessionToken, ip_address: ip,
-            created_at: Date.now(), expires_at: expiryMs, is_active: true
+        await supabase
+            .from('key_sessions')
+            .insert({
+                key_text: newKey,
+                session_token: sessionToken,
+                device_fingerprint: deviceFp,
+                ip_address: ip,
+                created_at: Date.now(),
+                expires_at: expiryMs,
+                is_active: true
+            });
+        
+        // Log security event
+        await logSecurityEvent('KEY_CLAIMED', `Key claimed with ${bindingType} binding, expires in ${days}d ${hours}h ${minutes}m`, ip, deviceFp, userId);
+        
+        // Format expiry string untuk response
+        let expiryString = '';
+        if (days > 0) expiryString += `${days} day${days > 1 ? 's' : ''} `;
+        if (hours > 0) expiryString += `${hours} hour${hours > 1 ? 's' : ''} `;
+        if (minutes > 0) expiryString += `${minutes} minute${minutes > 1 ? 's' : ''}`;
+        if (!expiryString) expiryString = `${totalHours} hours`;
+        
+        res.json({
+            success: true,
+            key: newKey,
+            sessionToken: sessionToken,
+            duration: totalHours,
+            durationDetail: {
+                days: days,
+                hours: hours,
+                minutes: minutes
+            },
+            expiryMs: expiryMs,
+            expiryFormatted: new Date(expiryMs).toLocaleString(),
+            expiryReadable: expiryString.trim(),
+            bindingType: bindingType,
+            bindingMessage: bindingMessage,
+            maxDevices: defaultMaxDevices,
+            message: `🔓 Key generated! ${bindingMessage} Expires in: ${expiryString.trim()}`
         });
         
-        res.json({ success: true, key: newKey, sessionToken: sessionToken, duration: durationHours, expiryMs: expiryMs, expiryFormatted: new Date(expiryMs).toLocaleString(), maxDevices: defaultMaxDevices, message: `🔓 Key generated! Can be used on ${defaultMaxDevices} device(s).` });
     } catch (err) {
+        console.error('Claim error:', err);
         res.json({ success: false, error: err.message });
     }
 });
@@ -567,38 +731,176 @@ app.post('/api/admin/users', verifyAdmin, async (req, res) => {
 
 app.post('/api/admin/add-key', verifyAdmin, async (req, res) => {
     try {
-        const { userId, hours = 3, keyText, maxDevices = 1 } = req.body;
-        if (!userId) return res.json({ success: false, error: 'User ID required' });
+        const { 
+            userId, 
+            keyText, 
+            days = 0, 
+            hours = 0, 
+            minutes = 0, 
+            maxDevices = 1,
+            bindingType = 'device',
+            lockToIp = null
+        } = req.body;
         
-        const expiryMs = Date.now() + (hours * 3600000);
+        if (!userId) {
+            return res.json({ success: false, error: 'User ID required' });
+        }
+        
+        // HITUNG TOTAL HOURS dengan benar
+        const totalHours = (days * 24) + hours + (minutes / 60);
+        if (totalHours <= 0) {
+            return res.json({ success: false, error: 'Duration must be greater than 0' });
+        }
+        
+        const expiryMs = Date.now() + (totalHours * 3600000);
         const newKey = keyText || generateKey();
         
-        await supabase.from('keys').insert({ key_text: newKey, user_id: userId, duration_hours: hours, expiry_ms: expiryMs, created_at: Date.now(), status: 'active', is_admin_key: 1, created_by: 'admin', max_devices: maxDevices, current_devices: 0, binding_type: 'device' });
+        // Proses binding type
+        let finalLockIp = null;
+        if (lockToIp === '0.0.0.0') {
+            finalLockIp = '0.0.0.0';
+        } else if (lockToIp) {
+            finalLockIp = lockToIp;
+        }
         
-        res.json({ success: true, key: newKey, expiryFormatted: new Date(expiryMs).toLocaleString(), maxDevices: maxDevices });
+        const { error } = await supabase.from('keys').insert({
+            key_text: newKey,
+            user_id: userId,
+            duration_hours: totalHours,
+            duration_days: days,
+            duration_minutes: minutes,
+            expiry_ms: expiryMs,
+            created_at: Date.now(),
+            status: 'active',
+            is_admin_key: 1,
+            created_by: 'admin',
+            locked_ip: finalLockIp,
+            max_devices: maxDevices,
+            current_devices: 0,
+            binding_type: bindingType
+        });
+        
+        if (error) {
+            return res.json({ success: false, error: error.message });
+        }
+        
+        // Update atau create user
+        const { data: user } = await supabase
+            .from('users')
+            .select('keys_generated')
+            .eq('user_id', userId)
+            .maybeSingle();
+        
+        if (user) {
+            await supabase
+                .from('users')
+                .update({ keys_generated: (user.keys_generated || 0) + 1 })
+                .eq('user_id', userId);
+        } else {
+            await supabase
+                .from('users')
+                .insert({
+                    user_id: userId,
+                    keys_generated: 1,
+                    created_at: Date.now()
+                });
+        }
+        
+        res.json({ 
+            success: true, 
+            key: newKey, 
+            expiryMs: expiryMs,
+            expiryFormatted: new Date(expiryMs).toLocaleString(),
+            duration: {
+                days: days,
+                hours: hours,
+                minutes: minutes,
+                totalHours: totalHours
+            },
+            maxDevices: maxDevices,
+            message: `✅ Key created! Expires in ${days}d ${hours}h ${minutes}m`
+        });
+        
     } catch (err) {
+        console.error('Add key error:', err);
         res.json({ success: false, error: err.message });
     }
 });
 
 app.post('/api/admin/add-bulk-keys', verifyAdmin, async (req, res) => {
     try {
-        const { userId, count = 1, days = 0, hours = 3, minutes = 0, maxDevices = 1, bindingType = 'device' } = req.body;
-        if (!userId) return res.json({ success: false, error: 'User ID required' });
-        if (count > 100) return res.json({ success: false, error: 'Max 100 keys at once' });
+        const { 
+            userId, 
+            count = 1, 
+            days = 0, 
+            hours = 0, 
+            minutes = 0, 
+            maxDevices = 1,
+            bindingType = 'device',
+            lockToIp = null
+        } = req.body;
         
-        const totalHours = days * 24 + hours + minutes / 60;
+        if (!userId) {
+            return res.json({ success: false, error: 'User ID required' });
+        }
+        
+        if (count > 100) {
+            return res.json({ success: false, error: 'Max 100 keys at once' });
+        }
+        
+        const totalHours = (days * 24) + hours + (minutes / 60);
         const expiryMs = Date.now() + (totalHours * 3600000);
         const keys = [];
         
         for (let i = 0; i < count; i++) {
             const newKey = generateKey();
-            const { error } = await supabase.from('keys').insert({ key_text: newKey, user_id: userId, duration_hours: totalHours, expiry_ms: expiryMs, created_at: Date.now(), status: 'active', is_admin_key: 1, created_by: 'admin', max_devices: maxDevices, current_devices: 0, binding_type: bindingType });
-            if (!error) keys.push(newKey);
+            
+            let finalLockIp = null;
+            if (lockToIp === '0.0.0.0') {
+                finalLockIp = '0.0.0.0';
+            } else if (lockToIp) {
+                finalLockIp = lockToIp;
+            }
+            
+            const { error } = await supabase.from('keys').insert({
+                key_text: newKey,
+                user_id: userId,
+                duration_hours: totalHours,
+                duration_days: days,
+                duration_minutes: minutes,
+                expiry_ms: expiryMs,
+                created_at: Date.now(),
+                status: 'active',
+                is_admin_key: 1,
+                created_by: 'admin',
+                locked_ip: finalLockIp,
+                max_devices: maxDevices,
+                current_devices: 0,
+                binding_type: bindingType
+            });
+            
+            if (!error) {
+                keys.push(newKey);
+            }
         }
         
-        res.json({ success: true, keys: keys, count: keys.length, expiryMs: expiryMs, expiryFormatted: new Date(expiryMs).toLocaleString(), bindingType: bindingType, message: `✅ Generated ${keys.length} keys with max ${maxDevices} device(s) each!` });
+        res.json({ 
+            success: true, 
+            keys: keys,
+            count: keys.length,
+            expiryMs: expiryMs,
+            expiryFormatted: new Date(expiryMs).toLocaleString(),
+            duration: {
+                days: days,
+                hours: hours,
+                minutes: minutes,
+                totalHours: totalHours
+            },
+            message: `✅ Generated ${keys.length} keys! Expires in ${days}d ${hours}h ${minutes}m`
+        });
+        
     } catch (err) {
+        console.error('Bulk keys error:', err);
         res.json({ success: false, error: err.message });
     }
 });
