@@ -12,8 +12,8 @@ app.use(express.static('public'));
 // ============================================================
 // SUPABASE CONFIGURATION
 // ============================================================
-const SUPABASE_URL = "https://ulxydqnbtiihmdphsemd.supabase.co";
-const SUPABASE_SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVseHlkcW5idGlpaG1kcGhzZW1kIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NTk0MTk0NSwiZXhwIjoyMDkxNTE3OTQ1fQ.Aq4L78N3eJQv7yzqvPqUFat-wjY6L_h7sTY3qnq-x00";
+const SUPABASE_URL = "https://rxcrixzkzebvwfxvcrbp.supabase.co";
+const SUPABASE_SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ4Y3JpeHpremVidndmeHZjcmJwIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NzYyMzY5MSwiZXhwIjoyMDkzMTk5NjkxfQ.Duvgh_hesCFhTClsAFBp4kE-tDUwp3f0HVNFbGG2lMc";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
