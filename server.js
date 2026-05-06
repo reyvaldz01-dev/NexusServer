@@ -240,112 +240,313 @@ app.post('/api/verify-key', async (req, res) => {
 // ============================================================
 // RESELLER API
 // ============================================================
-const DURATION_OPTIONS = [{ days: 1, coins: 5 }, { days: 3, coins: 12 }, { days: 7, coins: 25 }, { days: 15, coins: 45 }, { days: 30, coins: 80 }];
-const DEVICE_OPTIONS = [{ limit: 1, extra: 0 }, { limit: 10, extra: 10 }, { limit: 20, extra: 18 }, { limit: 30, extra: 25 }, { limit: 50, extra: 40 }];
+const RESELLER_DURATIONS = [
+    { days: 1, coins: 5 },
+    { days: 3, coins: 12 },
+    { days: 7, coins: 25 },
+    { days: 15, coins: 45 },
+    { days: 30, coins: 80 }
+];
 
-function calculatePrice(durationDays, deviceLimit) {
-    const durationPrice = DURATION_OPTIONS.find(d => d.days === durationDays)?.coins || 5;
-    const deviceExtra = DEVICE_OPTIONS.find(d => d.limit === deviceLimit)?.extra || 0;
-    return durationPrice + deviceExtra;
+const RESELLER_DEVICE_LIMITS = [
+    { limit: 1, extra: 0 },
+    { limit: 10, extra: 10 },
+    { limit: 20, extra: 18 },
+    { limit: 30, extra: 25 },
+    { limit: 50, extra: 40 }
+];
+
+function calculateResellerPrice(durationDays, deviceLimit) {
+    const duration = RESELLER_DURATIONS.find(d => d.days === durationDays);
+    const device = RESELLER_DEVICE_LIMITS.find(d => d.limit === deviceLimit);
+    return (duration?.coins || 5) + (device?.extra || 0);
 }
 
-// ============================================================
-// RESELLER LOGIN (FIXED)
-// ============================================================
+// RESELLER LOGIN
 app.post('/api/reseller/login', async (req, res) => {
     try {
         const { username, password } = req.body;
         
-        console.log(`🔑 Reseller login attempt: ${username}`);
+        console.log(`[RESELLER] Login attempt: ${username}`);
         
         if (!username || !password) {
             return res.json({ success: false, error: 'Username and password required' });
         }
         
-        // Cari user dengan role reseller
         const { data: user, error } = await supabase
             .from('users')
-            .select('*')
+            .select('user_id, coins, role, reseller_password, reseller_approved')
             .eq('user_id', username)
-            .eq('role', 'reseller')
-            .maybeSingle();
+            .single();
         
-        if (error) {
-            console.error('Database error:', error);
-            return res.json({ success: false, error: 'Database error' });
+        if (error || !user) {
+            console.log(`[RESELLER] User not found: ${username}`);
+            return res.json({ success: false, error: 'Invalid credentials' });
         }
         
-        if (!user) {
-            console.log(`❌ Reseller not found: ${username}`);
-            return res.json({ success: false, error: 'Invalid reseller credentials' });
+        if (user.role !== 'reseller') {
+            console.log(`[RESELLER] Not a reseller: ${username}, role: ${user.role}`);
+            return res.json({ success: false, error: 'Account is not a reseller' });
         }
         
-        // Cek password
         if (user.reseller_password !== password) {
-            console.log(`❌ Password mismatch for: ${username}`);
-            return res.json({ success: false, error: 'Invalid reseller credentials' });
+            console.log(`[RESELLER] Wrong password for: ${username}`);
+            return res.json({ success: false, error: 'Invalid credentials' });
         }
         
-        // Cek reseller_approved
         if (!user.reseller_approved) {
-            console.log(`❌ Reseller not approved: ${username}`);
-            return res.json({ success: false, error: 'Reseller account not approved' });
+            return res.json({ success: false, error: 'Account not approved yet' });
         }
         
-        console.log(`✅ Reseller logged in: ${username}, Coins: ${user.coins}`);
+        console.log(`[RESELLER] Login success: ${username}, Coins: ${user.coins}`);
         
         const token = generateSessionToken();
         
-        res.json({ 
-            success: true, 
-            token,
-            user: { 
-                user_id: user.user_id, 
+        // Simpan session untuk reseller
+        await supabase.from('key_sessions').insert({
+            session_token: token,
+            key_text: `reseller_${username}`,
+            ip_address: getClientIp(req),
+            created_at: Date.now(),
+            expires_at: Date.now() + 7 * 24 * 3600000,
+            is_active: true
+        });
+        
+        res.json({
+            success: true,
+            token: token,
+            user: {
+                user_id: user.user_id,
                 coins: user.coins || 0,
-                language: user.language || 'id' 
+                language: 'id'
             }
         });
         
     } catch (err) {
-        console.error('Reseller login error:', err);
+        console.error('[RESELLER] Login error:', err);
         res.json({ success: false, error: err.message });
     }
 });
 
-app.post('/api/reseller/create-key', verifyReseller, async (req, res) => {
-    const { durationDays, deviceLimit, buyerEmail } = req.body;
-    const reseller = req.reseller;
-    const validDurations = [1, 3, 7, 15, 30];
-    const validDeviceLimits = [1, 10, 20, 30, 50];
-    if (!validDurations.includes(durationDays)) return res.json({ success: false, error: 'Invalid duration' });
-    if (!validDeviceLimits.includes(deviceLimit)) return res.json({ success: false, error: 'Invalid device limit' });
-    
-    const price = calculatePrice(durationDays, deviceLimit);
-    if (reseller.coins < price) return res.json({ success: false, error: 'Insufficient coins', needed: price, current: reseller.coins });
-    
-    const newKey = generateKey();
-    const expiryMs = Date.now() + (durationDays * 24 * 3600000);
-    await supabase.from('users').update({ coins: reseller.coins - price }).eq('user_id', reseller.user_id);
-    await supabase.from('coin_transactions').insert({ user_id: reseller.user_id, amount: -price, type: 'purchase', reason: `Created key for ${durationDays} days, ${deviceLimit} devices`, created_at: Date.now(), created_by: reseller.user_id });
-    await supabase.from('keys').insert({ key_text: newKey, user_id: reseller.user_id, duration_hours: durationDays * 24, duration_days: durationDays, expiry_ms: expiryMs, created_at: Date.now(), status: 'active', created_by: 'reseller', max_devices: deviceLimit });
-    await supabase.from('reseller_keys').insert({ key_text: newKey, reseller_id: reseller.user_id, duration_days: durationDays, max_devices: deviceLimit, price_coins: price, buyer_email: buyerEmail, created_at: Date.now() });
-    
-    res.json({ success: true, key: newKey, expiryFormatted: new Date(expiryMs).toLocaleString(), remainingCoins: reseller.coins - price, price, durationDays, deviceLimit });
+// RESELLER GET BALANCE
+app.post('/api/reseller/balance', async (req, res) => {
+    try {
+        const { token, userId } = req.body;
+        
+        if (!token && !userId) {
+            return res.json({ success: false, error: 'Authentication required' });
+        }
+        
+        let resellerId = userId;
+        
+        // Jika pakai token, cari user dari session
+        if (token && !userId) {
+            const { data: session } = await supabase
+                .from('key_sessions')
+                .select('key_text')
+                .eq('session_token', token)
+                .eq('is_active', true)
+                .single();
+            
+            if (session && session.key_text.startsWith('reseller_')) {
+                resellerId = session.key_text.replace('reseller_', '');
+            }
+        }
+        
+        if (!resellerId) {
+            return res.json({ success: false, error: 'User ID required' });
+        }
+        
+        const { data: user } = await supabase
+            .from('users')
+            .select('user_id, coins')
+            .eq('user_id', resellerId)
+            .single();
+        
+        if (!user) {
+            return res.json({ success: false, error: 'User not found' });
+        }
+        
+        res.json({ success: true, coins: user.coins || 0, userId: user.user_id });
+        
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
 });
 
-app.post('/api/reseller/balance', verifyReseller, async (req, res) => {
-    res.json({ success: true, coins: req.reseller.coins, userId: req.reseller.user_id });
+// RESELLER CREATE KEY
+app.post('/api/reseller/create-key', async (req, res) => {
+    try {
+        const { userId, durationDays, deviceLimit, buyerEmail } = req.body;
+        
+        console.log(`[RESELLER] Create key request - User: ${userId}, Duration: ${durationDays}, Device: ${deviceLimit}`);
+        
+        if (!userId) {
+            return res.json({ success: false, error: 'User ID required' });
+        }
+        
+        // Validasi durasi dan device limit
+        const validDurations = [1, 3, 7, 15, 30];
+        const validDeviceLimits = [1, 10, 20, 30, 50];
+        
+        if (!validDurations.includes(durationDays)) {
+            return res.json({ success: false, error: 'Invalid duration. Choose: 1, 3, 7, 15, 30' });
+        }
+        if (!validDeviceLimits.includes(deviceLimit)) {
+            return res.json({ success: false, error: 'Invalid device limit. Choose: 1, 10, 20, 30, 50' });
+        }
+        
+        // Cek reseller
+        const { data: reseller, error: userError } = await supabase
+            .from('users')
+            .select('*')
+            .eq('user_id', userId)
+            .single();
+        
+        if (userError || !reseller) {
+            return res.json({ success: false, error: 'Reseller not found' });
+        }
+        
+        if (reseller.role !== 'reseller') {
+            return res.json({ success: false, error: 'Account is not a reseller' });
+        }
+        
+        const price = calculateResellerPrice(durationDays, deviceLimit);
+        
+        console.log(`[RESELLER] Price: ${price} coins, Current coins: ${reseller.coins}`);
+        
+        if (reseller.coins < price) {
+            return res.json({ 
+                success: false, 
+                error: `Insufficient coins! Need ${price} coins, you have ${reseller.coins}`,
+                needed: price,
+                current: reseller.coins
+            });
+        }
+        
+        // Generate key
+        const newKey = generateKey();
+        const expiryMs = Date.now() + (durationDays * 24 * 3600000);
+        
+        // Kurangi coins reseller
+        const newBalance = reseller.coins - price;
+        await supabase
+            .from('users')
+            .update({ coins: newBalance })
+            .eq('user_id', userId);
+        
+        // Catat transaksi coin
+        await supabase
+            .from('coin_transactions')
+            .insert({
+                user_id: userId,
+                amount: -price,
+                type: 'purchase',
+                reason: `Created key for ${durationDays} days, ${deviceLimit} devices`,
+                created_at: Date.now(),
+                created_by: userId
+            });
+        
+        // Buat key di tabel keys
+        await supabase
+            .from('keys')
+            .insert({
+                key_text: newKey,
+                user_id: userId,
+                duration_hours: durationDays * 24,
+                duration_days: durationDays,
+                expiry_ms: expiryMs,
+                created_at: Date.now(),
+                status: 'active',
+                created_by: 'reseller',
+                max_devices: deviceLimit,
+                current_devices: 0
+            });
+        
+        // Catat di reseller_keys
+        await supabase
+            .from('reseller_keys')
+            .insert({
+                key_text: newKey,
+                reseller_id: userId,
+                duration_days: durationDays,
+                max_devices: deviceLimit,
+                price_coins: price,
+                buyer_email: buyerEmail || null,
+                status: 'active',
+                created_at: Date.now()
+            });
+        
+        console.log(`[RESELLER] Key created: ${newKey} for ${userId}, Remaining coins: ${newBalance}`);
+        
+        res.json({
+            success: true,
+            key: newKey,
+            expiryFormatted: new Date(expiryMs).toLocaleString(),
+            remainingCoins: newBalance,
+            price: price,
+            durationDays: durationDays,
+            deviceLimit: deviceLimit,
+            message: `✅ Key created successfully! Remaining coins: ${newBalance}`
+        });
+        
+    } catch (err) {
+        console.error('[RESELLER] Create key error:', err);
+        res.json({ success: false, error: err.message });
+    }
 });
 
-app.post('/api/reseller/history', verifyReseller, async (req, res) => {
-    const { data: keys } = await supabase.from('reseller_keys').select('*').eq('reseller_id', req.reseller.user_id).order('created_at', { ascending: false }).limit(50);
-    const { data: transactions } = await supabase.from('coin_transactions').select('*').eq('user_id', req.reseller.user_id).order('created_at', { ascending: false }).limit(50);
-    res.json({ success: true, keys: keys || [], transactions: transactions || [] });
+// RESELLER GET HISTORY
+app.post('/api/reseller/history', async (req, res) => {
+    try {
+        const { userId } = req.body;
+        
+        if (!userId) {
+            return res.json({ success: false, error: 'User ID required' });
+        }
+        
+        // Ambil keys yang dibuat reseller
+        const { data: keys } = await supabase
+            .from('reseller_keys')
+            .select('*')
+            .eq('reseller_id', userId)
+            .order('created_at', { ascending: false })
+            .limit(50);
+        
+        // Ambil transaksi coin
+        const { data: transactions } = await supabase
+            .from('coin_transactions')
+            .select('*')
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .limit(50);
+        
+        res.json({ 
+            success: true, 
+            keys: keys || [], 
+            transactions: transactions || [] 
+        });
+        
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
 });
 
-app.post('/api/reseller/language', verifyReseller, async (req, res) => {
-    await supabase.from('users').update({ language: req.body.language }).eq('user_id', req.reseller.user_id);
-    res.json({ success: true });
+// RESELLER UPDATE LANGUAGE
+app.post('/api/reseller/language', async (req, res) => {
+    try {
+        const { userId, language } = req.body;
+        
+        await supabase
+            .from('users')
+            .update({ language: language || 'id' })
+            .eq('user_id', userId);
+        
+        res.json({ success: true });
+        
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
 });
 
 // ============================================================
