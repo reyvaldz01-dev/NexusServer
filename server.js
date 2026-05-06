@@ -249,42 +249,67 @@ function calculatePrice(durationDays, deviceLimit) {
     return durationPrice + deviceExtra;
 }
 
+// ============================================================
+// RESELLER LOGIN (FIXED)
+// ============================================================
 app.post('/api/reseller/login', async (req, res) => {
-    const { username, password } = req.body;
-    
-    console.log(`Reseller login attempt: ${username}`);
-    
-    // Cek di database
-    const { data: user, error } = await supabase
-        .from('users')
-        .select('*')
-        .eq('user_id', username)
-        .eq('reseller_password', password)
-        .eq('role', 'reseller')
-        .maybeSingle();
-    
-    if (error) {
-        console.error('Database error:', error);
-        return res.json({ success: false, error: 'Database error' });
+    try {
+        const { username, password } = req.body;
+        
+        console.log(`🔑 Reseller login attempt: ${username}`);
+        
+        if (!username || !password) {
+            return res.json({ success: false, error: 'Username and password required' });
+        }
+        
+        // Cari user dengan role reseller
+        const { data: user, error } = await supabase
+            .from('users')
+            .select('*')
+            .eq('user_id', username)
+            .eq('role', 'reseller')
+            .maybeSingle();
+        
+        if (error) {
+            console.error('Database error:', error);
+            return res.json({ success: false, error: 'Database error' });
+        }
+        
+        if (!user) {
+            console.log(`❌ Reseller not found: ${username}`);
+            return res.json({ success: false, error: 'Invalid reseller credentials' });
+        }
+        
+        // Cek password
+        if (user.reseller_password !== password) {
+            console.log(`❌ Password mismatch for: ${username}`);
+            return res.json({ success: false, error: 'Invalid reseller credentials' });
+        }
+        
+        // Cek reseller_approved
+        if (!user.reseller_approved) {
+            console.log(`❌ Reseller not approved: ${username}`);
+            return res.json({ success: false, error: 'Reseller account not approved' });
+        }
+        
+        console.log(`✅ Reseller logged in: ${username}, Coins: ${user.coins}`);
+        
+        const token = generateSessionToken();
+        
+        res.json({ 
+            success: true, 
+            token,
+            user: { 
+                user_id: user.user_id, 
+                coins: user.coins || 0,
+                language: user.language || 'id' 
+            }
+        });
+        
+    } catch (err) {
+        console.error('Reseller login error:', err);
+        res.json({ success: false, error: err.message });
     }
-    
-    if (!user) {
-        console.log(`Reseller not found: ${username}`);
-        return res.json({ success: false, error: 'Invalid reseller credentials' });
-    }
-    
-    console.log(`Reseller logged in: ${username}, Coins: ${user.coins}`);
-    
-    const token = generateSessionToken();
-    res.json({ 
-        success: true, 
-        token, 
-        user: { 
-            user_id: user.user_id, 
-            coins: user.coins, 
-            language: user.language || 'id' 
-        } 
-    });
 });
 
 app.post('/api/reseller/create-key', verifyReseller, async (req, res) => {
