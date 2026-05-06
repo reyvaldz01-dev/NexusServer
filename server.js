@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const { createClient } = require('@supabase/supabase-js');
+const axios = require('axios');
 
 const app = express();
 app.use(cors());
@@ -18,6 +19,12 @@ const SUPABASE_SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3Mi
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ============================================================
+// PAKASIR CONFIGURATION
+// ============================================================
+const PAKASIR_API_KEY = "YOUR_PAKASIR_API_KEY"; // Ganti dengan API key dari Pakasir
+const PAKASIR_API_URL = "https://app.pakasir.com/api/v1";
+
+// ============================================================
 // ADMIN CONFIGURATION
 // ============================================================
 const ADMIN_PASSWORD = "67";
@@ -25,77 +32,50 @@ let adminToken = null;
 let adminTokenExpiry = null;
 
 // ============================================================
-// MAINTENANCE MODE FUNCTIONS
+// TRANSLATIONS (MULTI-LANGUAGE)
 // ============================================================
-async function isMaintenanceMode() {
-    try {
-        const { data } = await supabase
-            .from('system_settings')
-            .select('value')
-            .eq('key', 'maintenance_mode')
-            .single();
-        return data?.value === 'true';
-    } catch (error) {
-        return false;
+const translations = {
+    id: {
+        welcome: "Selamat Datang di Nexus System",
+        key_not_found: "Key tidak ditemukan",
+        key_expired: "Key sudah kadaluarsa",
+        invalid_credentials: "Username atau password salah",
+        insufficient_coins: "Saldo coin tidak mencukupi",
+        payment_success: "Pembayaran berhasil",
+        payment_failed: "Pembayaran gagal",
+        key_created: "Key berhasil dibuat",
+        select_duration: "Pilih durasi",
+        select_device_limit: "Pilih batas device",
+        total_price: "Total harga",
+        your_coins: "Saldo Coin Anda",
+        buy_now: "Beli Sekarang",
+        transaction_history: "Riwayat Transaksi"
+    },
+    en: {
+        welcome: "Welcome to Nexus System",
+        key_not_found: "Key not found",
+        key_expired: "Key has expired",
+        invalid_credentials: "Invalid username or password",
+        insufficient_coins: "Insufficient coin balance",
+        payment_success: "Payment successful",
+        payment_failed: "Payment failed",
+        key_created: "Key created successfully",
+        select_duration: "Select duration",
+        select_device_limit: "Select device limit",
+        total_price: "Total price",
+        your_coins: "Your Coin Balance",
+        buy_now: "Buy Now",
+        transaction_history: "Transaction History"
     }
+};
+
+function t(lang, key) {
+    return translations[lang]?.[key] || translations.id[key] || key;
 }
-
-async function getMaintenanceMessage() {
-    try {
-        const { data } = await supabase
-            .from('system_settings')
-            .select('value')
-            .eq('key', 'maintenance_message')
-            .single();
-        return data?.value || 'Server is under maintenance. Please come back later.';
-    } catch (error) {
-        return 'Server is under maintenance. Please come back later.';
-    }
-}
-
-// ============================================================
-// MAINTENANCE MIDDLEWARE
-// ============================================================
-app.use('/api/', async (req, res, next) => {
-    if (req.path.includes('/admin/') || req.path === '/api/health' || req.path === '/api/maintenance-status') {
-        return next();
-    }
-    
-    const maintenance = await isMaintenanceMode();
-    if (maintenance) {
-        const message = await getMaintenanceMessage();
-        return res.status(503).json({
-            success: false,
-            maintenance: true,
-            message: message,
-            error: 'Service temporarily unavailable'
-        });
-    }
-    next();
-});
-
-// ============================================================
-// RATE LIMITING
-// ============================================================
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 100,
-    message: { success: false, error: 'Too many requests, please try again later.' }
-});
-
-const strictLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000,
-    max: 10,
-    message: { success: false, error: 'Rate limit exceeded. Try again in an hour.' }
-});
-
-app.use('/api/verify-key', strictLimiter);
-app.use('/api/claim', limiter);
 
 // ============================================================
 // HELPER FUNCTIONS
 // ============================================================
-
 function generateKey() {
     const prefix = "NX";
     const timestamp = Date.now().toString(36).toUpperCase();
@@ -108,228 +88,54 @@ function generateSessionToken() {
     return crypto.randomBytes(32).toString('hex');
 }
 
-function generateDeviceFingerprint(req) {
-    const userAgent = req.headers['user-agent'] || '';
-    const acceptLang = req.headers['accept-language'] || '';
-    const platform = req.headers['sec-ch-ua-platform'] || '';
-    const timezone = req.headers['timezone'] || Intl.DateTimeFormat().resolvedOptions().timeZone;
-    
-    const fingerprintString = `${userAgent}|${acceptLang}|${platform}|${timezone}`;
-    return crypto.createHash('sha256').update(fingerprintString).digest('hex').substring(0, 64);
-}
-
 function formatTimeRemaining(expiryMs) {
     const remaining = Math.max(0, expiryMs - Date.now());
     const days = Math.floor(remaining / 86400000);
     const hours = Math.floor((remaining % 86400000) / 3600000);
     const minutes = Math.floor((remaining % 3600000) / 60000);
-    const seconds = Math.floor((remaining % 60000) / 1000);
     
     if (days > 0) return `${days}d ${hours}h`;
     if (hours > 0) return `${hours}h ${minutes}m`;
-    if (minutes > 0) return `${minutes}m ${seconds}s`;
-    return `${seconds}s`;
+    return `${minutes}m`;
 }
 
 function getClientIp(req) {
     return req.headers['x-forwarded-for']?.split(',')[0] || 
-           req.headers['cf-connecting-ip'] || 
-           req.connection.remoteAddress || 
            req.socket.remoteAddress || 
            'unknown';
 }
 
-async function isIpBanned(ip) {
-    if (!ip || ip === 'unknown') return false;
-    const { data } = await supabase
-        .from('ip_blacklist')
-        .select('ip_address')
-        .eq('ip_address', ip)
-        .maybeSingle();
-    return !!data;
-}
-
-async function isDeviceBanned(deviceFingerprint) {
-    if (!deviceFingerprint) return false;
-    const { data } = await supabase
-        .from('device_blacklist')
-        .select('device_fingerprint')
-        .eq('device_fingerprint', deviceFingerprint)
-        .maybeSingle();
-    return !!data;
-}
-
 async function getSetting(key, defaultValue = 'false') {
-    const { data } = await supabase
-        .from('settings')
-        .select('value')
-        .eq('key', key)
-        .maybeSingle();
+    const { data } = await supabase.from('settings').select('value').eq('key', key).maybeSingle();
     return data?.value || defaultValue;
 }
 
 async function logSecurityEvent(eventType, details, ip, deviceFp, userId = null) {
     await supabase.from('security_logs').insert({
-        event_type: eventType,
-        details: details,
-        ip_address: ip,
-        device_fingerprint: deviceFp,
-        user_id: userId,
-        timestamp: Date.now()
+        event_type: eventType, details, ip_address: ip, device_fingerprint: deviceFp, user_id: userId, timestamp: Date.now()
     });
 }
 
-async function incrementFailedAttempts(ip, deviceFp, key = null) {
-    const today = new Date().toISOString().split('T')[0];
-    
-    const { data: record } = await supabase
-        .from('failed_attempts')
-        .select('attempts, id')
-        .eq('ip_address', ip)
-        .eq('date', today)
-        .maybeSingle();
-    
-    let newAttempts = 1;
-    
-    if (record) {
-        newAttempts = record.attempts + 1;
-        await supabase
-            .from('failed_attempts')
-            .update({ attempts: newAttempts, last_key: key, device_fingerprint: deviceFp })
-            .eq('id', record.id);
-    } else {
-        await supabase.from('failed_attempts').insert({
-            ip_address: ip,
-            device_fingerprint: deviceFp,
-            date: today,
-            attempts: 1,
-            last_key: key
-        });
-    }
-    
-    if (newAttempts >= 10) {
-        await supabase.from('ip_blacklist').insert({
-            ip_address: ip,
-            reason: `Auto-ban: ${newAttempts} failed key attempts in one day`,
-            banned_at: Date.now()
-        });
-        await logSecurityEvent('AUTO_BAN', `IP auto-banned after ${newAttempts} failed attempts`, ip, deviceFp);
-        return true;
-    }
-    return false;
-}
-
 // ============================================================
-// DEVICE LIMIT FUNCTIONS
+// MAINTENANCE MODE
 // ============================================================
-
-async function registerDevice(keyText, deviceFingerprint, req) {
-    const now = Date.now();
-    const deviceName = req.headers['sec-ch-ua'] || req.headers['user-agent']?.substring(0, 100) || 'Unknown Device';
-    
-    const { data: existing } = await supabase
-        .from('key_devices')
-        .select('*')
-        .eq('key_text', keyText)
-        .eq('device_fingerprint', deviceFingerprint)
-        .maybeSingle();
-    
-    if (existing) {
-        await supabase
-            .from('key_devices')
-            .update({ last_seen: now, ip_address: getClientIp(req), user_agent: req.headers['user-agent'] })
-            .eq('id', existing.id);
-        return { success: true, isNew: false };
-    }
-    
-    const { count: currentDevices } = await supabase
-        .from('key_devices')
-        .select('*', { count: 'exact', head: true })
-        .eq('key_text', keyText)
-        .eq('is_active', true);
-    
-    const { data: keyData } = await supabase
-        .from('keys')
-        .select('max_devices')
-        .eq('key_text', keyText)
-        .single();
-    
-    const maxDevices = keyData?.max_devices || parseInt(await getSetting('default_max_devices', '1'));
-    
-    if (currentDevices >= maxDevices) {
-        return { success: false, error: `Maximum ${maxDevices} device(s) allowed for this key.` };
-    }
-    
-    await supabase.from('key_devices').insert({
-        key_text: keyText,
-        device_fingerprint: deviceFingerprint,
-        device_name: deviceName,
-        ip_address: getClientIp(req),
-        user_agent: req.headers['user-agent'],
-        first_seen: now,
-        last_seen: now,
-        is_active: true
-    });
-    
-    await supabase
-        .from('keys')
-        .update({ current_devices: currentDevices + 1 })
-        .eq('key_text', keyText);
-    
-    return { success: true, isNew: true, currentDevices: currentDevices + 1, maxDevices: maxDevices };
-}
-
-async function getKeyDevices(keyText) {
-    const { data: devices } = await supabase
-        .from('key_devices')
-        .select('*')
-        .eq('key_text', keyText)
-        .eq('is_active', true)
-        .order('first_seen', { ascending: false });
-    return devices || [];
-}
-
-// ============================================================
-// AUTO DELETE EXPIRED KEYS
-// ============================================================
-async function deleteExpiredKeys() {
+async function isMaintenanceMode() {
     try {
-        const now = Date.now();
-        await supabase
-            .from('keys')
-            .update({ status: 'expired' })
-            .lt('expiry_ms', now)
-            .eq('status', 'active');
-        await supabase
-            .from('key_sessions')
-            .update({ is_active: false })
-            .lt('expires_at', now)
-            .eq('is_active', true);
-    } catch (err) {
-        console.error('Auto delete error:', err);
-    }
+        const { data } = await supabase.from('system_settings').select('value').eq('key', 'maintenance_mode').single();
+        return data?.value === 'true';
+    } catch { return false; }
 }
 
-setInterval(async () => {
-    await deleteExpiredKeys();
-}, 3600000);
-
-setTimeout(async () => {
-    await deleteExpiredKeys();
-}, 5000);
-
-// ============================================================
-// MIDDLEWARE
-// ============================================================
-async function checkIpBan(req, res, next) {
-    const ip = getClientIp(req);
-    const banned = await isIpBanned(ip);
-    if (banned) {
-        return res.status(403).json({ success: false, error: 'Your IP has been banned' });
-    }
+app.use('/api/', async (req, res, next) => {
+    if (req.path.includes('/admin/') || req.path === '/api/health' || req.path === '/api/maintenance-status') return next();
+    const maintenance = await isMaintenanceMode();
+    if (maintenance) return res.status(503).json({ success: false, maintenance: true, error: 'Service temporarily unavailable' });
     next();
-}
+});
 
+// ============================================================
+// AUTH MIDDLEWARE
+// ============================================================
 function verifyAdmin(req, res, next) {
     const token = req.body.token || req.query.token;
     if (!token || token !== adminToken || (adminTokenExpiry && Date.now() > adminTokenExpiry)) {
@@ -338,573 +144,500 @@ function verifyAdmin(req, res, next) {
     next();
 }
 
-app.use('/api/', checkIpBan);
+async function verifyReseller(req, res, next) {
+    const { username, password } = req.body;
+    if (!username || !password) {
+        return res.status(401).json({ success: false, error: 'Reseller credentials required' });
+    }
+    const { data: user } = await supabase.from('users').select('*').eq('user_id', username).eq('reseller_password', password).eq('role', 'reseller').maybeSingle();
+    if (!user) {
+        return res.status(401).json({ success: false, error: 'Invalid reseller credentials' });
+    }
+    req.reseller = user;
+    next();
+}
 
 // ============================================================
-// API: START CHALLENGE
+// RESELLER PRICE CONFIG
 // ============================================================
-app.post('/api/start', async (req, res) => {
-    try {
-        const { userId } = req.body;
-        const ip = getClientIp(req);
-        
-        if (!userId) return res.json({ success: false, error: 'User ID required' });
-        
-        let { data: user } = await supabase
-            .from('users')
-            .select('*')
-            .eq('user_id', userId)
-            .maybeSingle();
-        
-        if (!user) {
-            const { data: newUser } = await supabase
-                .from('users')
-                .insert({ user_id: userId, ip_address: ip, created_at: Date.now() })
-                .select()
-                .single();
-            user = newUser;
-        }
-        
-        res.json({ success: true, step1_completed: user.step1_completed || 0, step2_completed: user.step2_completed || 0 });
-    } catch (err) {
-        res.json({ success: false, error: err.message });
-    }
+const DURATION_OPTIONS = [
+    { days: 1, coins: 5 },
+    { days: 3, coins: 12 },
+    { days: 7, coins: 25 },
+    { days: 15, coins: 45 },
+    { days: 30, coins: 80 }
+];
+
+const DEVICE_LIMIT_OPTIONS = [
+    { limit: 1, extra: 0 },
+    { limit: 10, extra: 10 },
+    { limit: 20, extra: 18 },
+    { limit: 30, extra: 25 },
+    { limit: 50, extra: 40 }
+];
+
+function calculatePrice(durationDays, deviceLimit) {
+    const durationPrice = DURATION_OPTIONS.find(d => d.days === durationDays)?.coins || 5;
+    const deviceExtra = DEVICE_LIMIT_OPTIONS.find(d => d.limit === deviceLimit)?.extra || 0;
+    return durationPrice + deviceExtra;
+}
+
+// ============================================================
+// API: GET ANNOUNCEMENTS
+// ============================================================
+app.get('/api/announcements', async (req, res) => {
+    const now = Date.now();
+    const { data } = await supabase
+        .from('announcements')
+        .select('*')
+        .eq('is_active', true)
+        .lt('start_date', now)
+        .gt('end_date', now)
+        .order('created_at', { ascending: false });
+    res.json({ success: true, announcements: data || [] });
 });
 
-app.post('/api/step1', async (req, res) => {
-    try {
-        const { userId } = req.body;
-        if (!userId) return res.json({ success: false, error: 'User ID required' });
-        
-        const { data: user } = await supabase.from('users').select('*').eq('user_id', userId).single();
-        if (!user) return res.json({ success: false, error: 'User not found' });
-        
-        if (user.step1_completed === 1) {
-            return res.json({ success: true, alreadyCompleted: true, step: 2 });
-        }
-        
-        await supabase.from('users').update({ step1_completed: 1, step1_completed_at: Date.now() }).eq('user_id', userId);
-        res.json({ success: true, message: 'Step 1 completed! Now wait 100 seconds for step 2.', step: 2 });
-    } catch (err) {
-        res.json({ success: false, error: err.message });
-    }
+// ============================================================
+// API: GET USER NOTIFICATIONS
+// ============================================================
+app.get('/api/notifications/:userId', async (req, res) => {
+    const { userId } = req.params;
+    const { data } = await supabase
+        .from('user_notifications')
+        .select('*')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(50);
+    res.json({ success: true, notifications: data || [] });
 });
 
-app.post('/api/step2', async (req, res) => {
-    try {
-        const { userId } = req.body;
-        if (!userId) return res.json({ success: false, error: 'User ID required' });
-        
-        const { data: user } = await supabase.from('users').select('*').eq('user_id', userId).single();
-        if (!user) return res.json({ success: false, error: 'User not found' });
-        
-        if (user.step1_completed !== 1) {
-            return res.json({ success: false, error: 'Complete step 1 first!' });
-        }
-        
-        if (user.step2_completed === 1) {
-            return res.json({ success: true, alreadyCompleted: true });
-        }
-        
-        await supabase.from('users').update({ step2_completed: 1, step2_completed_at: Date.now() }).eq('user_id', userId);
-        res.json({ success: true, message: 'Step 2 completed! You can now claim your key.', canClaim: true });
-    } catch (err) {
-        res.json({ success: false, error: err.message });
-    }
+app.post('/api/notifications/read', async (req, res) => {
+    const { notificationId, userId } = req.body;
+    await supabase.from('user_notifications').update({ is_read: true }).eq('id', notificationId).eq('user_id', userId);
+    res.json({ success: true });
 });
 
-app.post('/api/claim', async (req, res) => {
+// ============================================================
+// API: RESELLER LOGIN
+// ============================================================
+app.post('/api/reseller/login', async (req, res) => {
+    const { username, password } = req.body;
+    const { data: user } = await supabase
+        .from('users')
+        .select('*')
+        .eq('user_id', username)
+        .eq('reseller_password', password)
+        .eq('role', 'reseller')
+        .maybeSingle();
+    
+    if (!user) {
+        return res.json({ success: false, error: 'Invalid credentials' });
+    }
+    
+    const token = generateSessionToken();
+    res.json({ success: true, token, user: { user_id: user.user_id, coins: user.coins, language: user.language || 'id' } });
+});
+
+// ============================================================
+// API: RESELLER CREATE KEY
+// ============================================================
+app.post('/api/reseller/create-key', verifyReseller, async (req, res) => {
+    const { durationDays, deviceLimit, buyerEmail } = req.body;
+    const reseller = req.reseller;
+    
+    const validDurations = [1, 3, 7, 15, 30];
+    const validDeviceLimits = [1, 10, 20, 30, 50];
+    
+    if (!validDurations.includes(durationDays)) {
+        return res.json({ success: false, error: 'Invalid duration' });
+    }
+    if (!validDeviceLimits.includes(deviceLimit)) {
+        return res.json({ success: false, error: 'Invalid device limit' });
+    }
+    
+    const price = calculatePrice(durationDays, deviceLimit);
+    
+    if (reseller.coins < price) {
+        return res.json({ success: false, error: 'Insufficient coins', needed: price, current: reseller.coins });
+    }
+    
+    const newKey = generateKey();
+    const expiryMs = Date.now() + (durationDays * 24 * 3600000);
+    
+    // Deduct coins
+    await supabase.from('users').update({ coins: reseller.coins - price }).eq('user_id', reseller.user_id);
+    
+    // Record coin transaction
+    await supabase.from('coin_transactions').insert({
+        user_id: reseller.user_id,
+        amount: -price,
+        type: 'purchase',
+        reason: `Created key for ${durationDays} days, ${deviceLimit} devices`,
+        created_at: Date.now(),
+        created_by: reseller.user_id
+    });
+    
+    // Create key
+    await supabase.from('keys').insert({
+        key_text: newKey,
+        user_id: reseller.user_id,
+        duration_hours: durationDays * 24,
+        duration_days: durationDays,
+        expiry_ms: expiryMs,
+        created_at: Date.now(),
+        status: 'active',
+        is_admin_key: 0,
+        created_by: 'reseller',
+        max_devices: deviceLimit,
+        binding_type: 'device'
+    });
+    
+    // Record reseller key
+    await supabase.from('reseller_keys').insert({
+        key_text: newKey,
+        reseller_id: reseller.user_id,
+        duration_days: durationDays,
+        max_devices: deviceLimit,
+        price_coins: price,
+        buyer_email: buyerEmail,
+        created_at: Date.now(),
+        status: 'active'
+    });
+    
+    res.json({
+        success: true,
+        key: newKey,
+        expiryFormatted: new Date(expiryMs).toLocaleString(),
+        remainingCoins: reseller.coins - price,
+        price: price,
+        durationDays: durationDays,
+        deviceLimit: deviceLimit
+    });
+});
+
+// ============================================================
+// API: RESELLER GET BALANCE
+// ============================================================
+app.post('/api/reseller/balance', verifyReseller, async (req, res) => {
+    res.json({ success: true, coins: req.reseller.coins, userId: req.reseller.user_id });
+});
+
+// ============================================================
+// API: RESELLER GET HISTORY
+// ============================================================
+app.post('/api/reseller/history', verifyReseller, async (req, res) => {
+    const { data: keys } = await supabase
+        .from('reseller_keys')
+        .select('*')
+        .eq('reseller_id', req.reseller.user_id)
+        .order('created_at', { ascending: false })
+        .limit(50);
+    
+    const { data: transactions } = await supabase
+        .from('coin_transactions')
+        .select('*')
+        .eq('user_id', req.reseller.user_id)
+        .order('created_at', { ascending: false })
+        .limit(50);
+    
+    res.json({ success: true, keys: keys || [], transactions: transactions || [] });
+});
+
+// ============================================================
+// API: RESELLER UPDATE LANGUAGE
+// ============================================================
+app.post('/api/reseller/language', verifyReseller, async (req, res) => {
+    const { language } = req.body;
+    await supabase.from('users').update({ language }).eq('user_id', req.reseller.user_id);
+    res.json({ success: true });
+});
+
+// ============================================================
+// API: CREATE PAYMENT (PAKASIR)
+// ============================================================
+app.post('/api/create-payment', async (req, res) => {
+    const { userId, coins, paymentMethod } = req.body;
+    
+    const pakasirPayload = {
+        api_key: PAKASIR_API_KEY,
+        amount: coins * 100, // Contoh: 1 coin = 100 IDR
+        customer_name: userId,
+        customer_email: `${userId}@nexus.com`,
+        payment_method: paymentMethod || 'qris',
+        return_url: 'https://nexusofc-generate-key.vercel.app/payment-callback.html',
+        expired_time: 24,
+        order_id: `INV-${Date.now()}-${userId}`
+    };
+    
     try {
-        const { 
-            userId, 
-            durationHours = 3, 
-            days = 0, 
-            hours = 0, 
-            minutes = 0,
-            bindingType = 'device'
-        } = req.body;
-        
-        const ip = getClientIp(req);
-        const deviceFp = generateDeviceFingerprint(req);
-        
-        // Validasi User ID
-        if (!userId) {
-            return res.json({ success: false, error: 'User ID required' });
-        }
-        
-        // HITUNG TOTAL DURASI dengan benar
-        let totalHours = durationHours;
-        if (days > 0 || hours > 0 || minutes > 0) {
-            totalHours = (days * 24) + hours + (minutes / 60);
-        }
-        
-        if (totalHours <= 0) {
-            return res.json({ success: false, error: 'Duration must be greater than 0' });
-        }
-        
-        // Cek user
-        const { data: user, error: userError } = await supabase
-            .from('users')
-            .select('*')
-            .eq('user_id', userId)
-            .single();
-        
-        if (userError || !user) {
-            return res.json({ success: false, error: 'User not found' });
-        }
-        
-        // Cek step 2 sudah selesai
-        if (user.step2_completed !== 1) {
-            return res.json({ success: false, error: 'Complete both steps first!' });
-        }
-        
-        // Cek sudah pernah claim
-        if (user.reward_claimed === 1) {
-            return res.json({ success: false, error: 'Reward already claimed!' });
-        }
-        
-        // Cek limit key per user
-        const maxKeysPerUser = parseInt(await getSetting('max_keys_per_user', '5'));
-        const { count: userKeys, error: countError } = await supabase
-            .from('keys')
-            .select('*', { count: 'exact', head: true })
-            .eq('user_id', userId)
-            .eq('status', 'active');
-        
-        if (countError) {
-            console.error('Count error:', countError);
-        }
-        
-        if (userKeys >= maxKeysPerUser) {
-            return res.json({ success: false, error: `Maximum ${maxKeysPerUser} keys per user` });
-        }
-        
-        // Generate key baru
-        const newKey = generateKey();
-        const expiryMs = Date.now() + (totalHours * 3600000);
-        const defaultMaxDevices = parseInt(await getSetting('default_max_devices', '1'));
-        
-        // Set binding type
-        let lockedIp = null;
-        let lockedDeviceFp = null;
-        let bindingMessage = '';
-        
-        switch(bindingType) {
-            case 'ip':
-                lockedIp = ip;
-                bindingMessage = `Key will be bound to IP: ${ip}`;
-                break;
-            case 'device':
-                lockedDeviceFp = deviceFp;
-                bindingMessage = `Key will be bound to this device fingerprint`;
-                break;
-            case 'both':
-                lockedIp = ip;
-                lockedDeviceFp = deviceFp;
-                bindingMessage = `Key will be bound to both IP and device fingerprint`;
-                break;
-            case 'none':
-                lockedIp = '0.0.0.0';
-                bindingMessage = `Key is NOT bound (can be used from anywhere) - INSECURE`;
-                break;
-            default:
-                lockedDeviceFp = deviceFp;
-                bindingMessage = `Key will be bound to this device fingerprint`;
-        }
-        
-        // Insert key ke database
-        const { error: insertError } = await supabase
-            .from('keys')
-            .insert({
-                key_text: newKey,
-                user_id: userId,
-                duration_hours: totalHours,
-                duration_days: days,
-                duration_minutes: minutes,
-                expiry_ms: expiryMs,
-                created_at: Date.now(),
-                status: 'active',
-                is_admin_key: 0,
-                created_by: 'user',
-                locked_ip: lockedIp,
-                locked_device_fingerprint: lockedDeviceFp,
-                binding_type: bindingType,
-                max_devices: defaultMaxDevices,
-                current_devices: 0,
-                used_count: 0
-            });
-        
-        if (insertError) {
-            console.error('Insert key error:', insertError);
-            return res.json({ success: false, error: insertError.message });
-        }
-        
-        // Register device pertama untuk key ini
-        try {
-            await supabase.from('key_devices').insert({
-                key_text: newKey,
-                device_fingerprint: deviceFp,
-                device_name: req.headers['user-agent']?.substring(0, 100) || 'Unknown Device',
-                ip_address: ip,
-                first_seen: Date.now(),
-                last_seen: Date.now(),
-                is_active: true
-            });
-            
-            await supabase
-                .from('keys')
-                .update({ current_devices: 1 })
-                .eq('key_text', newKey);
-        } catch (deviceError) {
-            console.error('Device register error:', deviceError);
-            // Tidak perlu return error, device register opsional
-        }
-        
-        // Update user
-        await supabase
-            .from('users')
-            .update({ 
-                reward_claimed: 1, 
-                keys_generated: (user.keys_generated || 0) + 1
-            })
-            .eq('user_id', userId);
-        
-        // Generate session token
-        const sessionToken = generateSessionToken();
-        await supabase
-            .from('key_sessions')
-            .insert({
-                key_text: newKey,
-                session_token: sessionToken,
-                device_fingerprint: deviceFp,
-                ip_address: ip,
-                created_at: Date.now(),
-                expires_at: expiryMs,
-                is_active: true
-            });
-        
-        // Log security event
-        await logSecurityEvent('KEY_CLAIMED', `Key claimed with ${bindingType} binding, expires in ${days}d ${hours}h ${minutes}m`, ip, deviceFp, userId);
-        
-        // Format expiry string untuk response
-        let expiryString = '';
-        if (days > 0) expiryString += `${days} day${days > 1 ? 's' : ''} `;
-        if (hours > 0) expiryString += `${hours} hour${hours > 1 ? 's' : ''} `;
-        if (minutes > 0) expiryString += `${minutes} minute${minutes > 1 ? 's' : ''}`;
-        if (!expiryString) expiryString = `${totalHours} hours`;
-        
-        res.json({
-            success: true,
-            key: newKey,
-            sessionToken: sessionToken,
-            duration: totalHours,
-            durationDetail: {
-                days: days,
-                hours: hours,
-                minutes: minutes
-            },
-            expiryMs: expiryMs,
-            expiryFormatted: new Date(expiryMs).toLocaleString(),
-            expiryReadable: expiryString.trim(),
-            bindingType: bindingType,
-            bindingMessage: bindingMessage,
-            maxDevices: defaultMaxDevices,
-            message: `🔓 Key generated! ${bindingMessage} Expires in: ${expiryString.trim()}`
+        const response = await axios.post(`${PAKASIR_API_URL}/create-transaction`, pakasirPayload, {
+            headers: { 'Content-Type': 'application/json' }
         });
         
-    } catch (err) {
-        console.error('Claim error:', err);
-        res.json({ success: false, error: err.message });
+        if (response.data && response.data.data) {
+            await supabase.from('payment_transactions').insert({
+                transaction_id: response.data.data.reference,
+                user_id: userId,
+                amount: coins * 100,
+                coins: coins,
+                payment_url: response.data.data.checkout_url,
+                status: 'pending',
+                created_at: Date.now()
+            });
+            
+            res.json({
+                success: true,
+                paymentUrl: response.data.data.checkout_url,
+                transactionId: response.data.data.reference
+            });
+        } else {
+            res.json({ success: false, error: 'Payment creation failed' });
+        }
+    } catch (error) {
+        console.error('Pakasir error:', error.message);
+        res.json({ success: false, error: 'Payment gateway error' });
     }
 });
 
-app.post('/api/verify-key', async (req, res) => {
-    try {
-        const { key, sessionToken } = req.body;
-        const userIp = getClientIp(req);
-        const deviceFp = generateDeviceFingerprint(req);
-        
-        if (!key) return res.json({ valid: false, error: 'Key is required' });
-        
-        const deviceBanned = await isDeviceBanned(deviceFp);
-        if (deviceBanned) return res.json({ valid: false, error: 'Your device has been banned' });
-        
-        const { data: keyData } = await supabase.from('keys').select('*').eq('key_text', key).single();
-        if (!keyData) return res.json({ valid: false, error: 'Key not found' });
-        
-        if (Date.now() > keyData.expiry_ms) {
-            await supabase.from('keys').update({ status: 'expired' }).eq('key_text', key);
-            return res.json({ valid: false, error: 'Key has expired' });
-        }
-        
-        if (keyData.status !== 'active') return res.json({ valid: false, error: 'Key is not active' });
-        
-        if (sessionToken) {
-            const { data: session } = await supabase.from('key_sessions').select('*').eq('session_token', sessionToken).eq('key_text', key).eq('is_active', true).gt('expires_at', Date.now()).maybeSingle();
-            if (session) {
-                await supabase.from('key_sessions').update({ last_used_at: Date.now(), ip_address: userIp }).eq('session_token', sessionToken);
-                return res.json({ valid: true, key: keyData.key_text, duration: keyData.duration_hours, expiryMs: keyData.expiry_ms, remaining: formatTimeRemaining(keyData.expiry_ms), message: '✅ Key valid' });
-            }
-        }
-        
-        const deviceRegistration = await registerDevice(key, deviceFp, req);
-        if (!deviceRegistration.success) return res.json({ valid: false, error: deviceRegistration.error });
-        
-        if (!keyData.locked_ip) {
-            await supabase.from('keys').update({ locked_ip: userIp, first_used_at: Date.now(), used_count: 1 }).eq('key_text', key);
-            const newSessionToken = generateSessionToken();
-            await supabase.from('key_sessions').insert({ key_text: key, session_token: newSessionToken, device_fingerprint: deviceFp, ip_address: userIp, created_at: Date.now(), expires_at: keyData.expiry_ms, is_active: true });
-            return res.json({ valid: true, key: keyData.key_text, sessionToken: newSessionToken, duration: keyData.duration_hours, expiryMs: keyData.expiry_ms, remaining: formatTimeRemaining(keyData.expiry_ms), maxDevices: keyData.max_devices, message: `✅ Key locked (${deviceRegistration.currentDevices || 1}/${keyData.max_devices} devices)` });
-        }
-        
-        if (keyData.locked_ip !== userIp) return res.json({ valid: false, error: `🔒 Key is locked to IP: ${keyData.locked_ip}` });
-        
-        await supabase.from('keys').update({ used_count: (keyData.used_count || 0) + 1 }).eq('key_text', key);
-        return res.json({ valid: true, key: keyData.key_text, duration: keyData.duration_hours, expiryMs: keyData.expiry_ms, remaining: formatTimeRemaining(keyData.expiry_ms), message: '✅ Key valid!' });
-    } catch (err) {
-        res.json({ valid: false, error: err.message });
-    }
-});
-
-app.get('/api/my-key/:userId', async (req, res) => {
-    try {
-        const { userId } = req.params;
-        const { data: keyData } = await supabase.from('keys').select('*').eq('user_id', userId).eq('status', 'active').gt('expiry_ms', Date.now()).maybeSingle();
-        if (!keyData) return res.json({ hasKey: false, message: 'No active key found' });
-        res.json({ hasKey: true, key: keyData.key_text, duration: keyData.duration_hours, expiryMs: keyData.expiry_ms, remaining: formatTimeRemaining(keyData.expiry_ms), maxDevices: keyData.max_devices });
-    } catch (err) {
-        res.json({ hasKey: false, error: err.message });
-    }
-});
-
-app.get('/api/maintenance-status', async (req, res) => {
-    const maintenance = await isMaintenanceMode();
-    const message = await getMaintenanceMessage();
-    res.json({ success: true, maintenance: maintenance, message: message });
-});
-
-app.get('/api/health', (req, res) => {
-    res.json({ status: 'healthy', timestamp: new Date().toISOString() });
-});
-
-// ============================================================
-// ============================================================
-// ADMIN API (LENGKAP)
-// ============================================================
-// ============================================================
-
-app.post('/api/admin/login', async (req, res) => {
-    const { username, password } = req.body;
-    const ip = getClientIp(req);
+app.post('/api/check-payment', async (req, res) => {
+    const { transactionId } = req.body;
     
-    if (username === 'admin' && password === ADMIN_PASSWORD) {
-        adminToken = crypto.randomBytes(32).toString('hex');
-        adminTokenExpiry = Date.now() + 3600000;
-        await supabase.from('admin_logs').insert({ action: 'LOGIN', details: 'Admin logged in', ip: ip, timestamp: Date.now() });
-        res.json({ success: true, token: adminToken, expiry: adminTokenExpiry });
-    } else {
-        res.json({ success: false, error: 'Invalid credentials' });
+    const { data: transaction } = await supabase
+        .from('payment_transactions')
+        .select('*')
+        .eq('transaction_id', transactionId)
+        .single();
+    
+    if (!transaction) {
+        return res.json({ status: 'not_found', error: 'Transaction not found' });
     }
+    
+    res.json({
+        status: transaction.status,
+        coins: transaction.coins,
+        amount: transaction.amount
+    });
 });
 
+// ============================================================
+// API: PAYMENT WEBHOOK (Pakasir)
+// ============================================================
+app.post('/api/payment-webhook', async (req, res) => {
+    const { reference, status, amount } = req.body;
+    
+    if (status === 'success') {
+        const { data: transaction } = await supabase
+            .from('payment_transactions')
+            .select('*')
+            .eq('transaction_id', reference)
+            .single();
+        
+        if (transaction && transaction.status === 'pending') {
+            await supabase.from('payment_transactions').update({ status: 'completed', completed_at: Date.now() }).eq('transaction_id', reference);
+            
+            // Add coins to user
+            const { data: user } = await supabase.from('users').select('coins').eq('user_id', transaction.user_id).single();
+            await supabase.from('users').update({ coins: (user.coins || 0) + transaction.coins }).eq('user_id', transaction.user_id);
+            
+            await supabase.from('coin_transactions').insert({
+                user_id: transaction.user_id,
+                amount: transaction.coins,
+                type: 'add',
+                reason: 'Topup via Pakasir',
+                created_at: Date.now(),
+                created_by: 'system'
+            });
+        }
+    }
+    
+    res.json({ success: true });
+});
+
+// ============================================================
+// ADMIN API (COIN MANAGEMENT, RESELLER, ANNOUNCEMENT, BROADCAST)
+// ============================================================
+
+// Get all resellers
+app.post('/api/admin/resellers', verifyAdmin, async (req, res) => {
+    const { data } = await supabase.from('users').select('*').eq('role', 'reseller').order('created_at', { ascending: false });
+    res.json({ success: true, resellers: data || [] });
+});
+
+// Create reseller account
+app.post('/api/admin/create-reseller', verifyAdmin, async (req, res) => {
+    const { username, password, initialCoins = 0 } = req.body;
+    
+    if (!username || !password) {
+        return res.json({ success: false, error: 'Username and password required' });
+    }
+    
+    const { data: existing } = await supabase.from('users').select('user_id').eq('user_id', username).maybeSingle();
+    if (existing) {
+        return res.json({ success: false, error: 'Username already exists' });
+    }
+    
+    await supabase.from('users').insert({
+        user_id: username,
+        reseller_password: password,
+        role: 'reseller',
+        coins: initialCoins,
+        reseller_approved: true,
+        created_at: Date.now()
+    });
+    
+    res.json({ success: true, message: `Reseller ${username} created with ${initialCoins} coins` });
+});
+
+// Add coins to reseller
+app.post('/api/admin/add-coins', verifyAdmin, async (req, res) => {
+    const { userId, amount, reason } = req.body;
+    
+    const { data: user } = await supabase.from('users').select('coins').eq('user_id', userId).single();
+    if (!user) return res.json({ success: false, error: 'User not found' });
+    
+    await supabase.from('users').update({ coins: (user.coins || 0) + amount }).eq('user_id', userId);
+    
+    await supabase.from('coin_transactions').insert({
+        user_id: userId,
+        amount: amount,
+        type: amount > 0 ? 'add' : 'deduct',
+        reason: reason || 'Admin adjustment',
+        created_at: Date.now(),
+        created_by: 'admin'
+    });
+    
+    res.json({ success: true, newBalance: (user.coins || 0) + amount });
+});
+
+// Get coin transactions
+app.post('/api/admin/coin-transactions', verifyAdmin, async (req, res) => {
+    const { userId, limit = 100 } = req.body;
+    let query = supabase.from('coin_transactions').select('*').order('created_at', { ascending: false }).limit(limit);
+    if (userId) query = query.eq('user_id', userId);
+    const { data } = await query;
+    res.json({ success: true, transactions: data || [] });
+});
+
+// Create announcement
+app.post('/api/admin/create-announcement', verifyAdmin, async (req, res) => {
+    const { title, content, type, startDate, endDate } = req.body;
+    
+    await supabase.from('announcements').insert({
+        title, content, type: type || 'info',
+        start_date: startDate || Date.now(),
+        end_date: endDate || (Date.now() + 30 * 24 * 3600000),
+        is_active: true,
+        created_at: Date.now(),
+        created_by: 'admin'
+    });
+    
+    res.json({ success: true });
+});
+
+// Get all announcements (admin)
+app.post('/api/admin/announcements', verifyAdmin, async (req, res) => {
+    const { data } = await supabase.from('announcements').select('*').order('created_at', { ascending: false });
+    res.json({ success: true, announcements: data || [] });
+});
+
+// Delete announcement
+app.post('/api/admin/delete-announcement', verifyAdmin, async (req, res) => {
+    const { id } = req.body;
+    await supabase.from('announcements').delete().eq('id', id);
+    res.json({ success: true });
+});
+
+// Broadcast to users
+app.post('/api/admin/broadcast', verifyAdmin, async (req, res) => {
+    const { title, message, targetRole } = req.body; // targetRole: 'all', 'reseller', 'user'
+    
+    let query = supabase.from('users').select('user_id');
+    if (targetRole && targetRole !== 'all') {
+        query = query.eq('role', targetRole);
+    }
+    
+    const { data: users } = await query;
+    
+    const notifications = users.map(user => ({
+        user_id: user.user_id,
+        title: title,
+        message: message,
+        type: 'broadcast',
+        created_at: Date.now()
+    }));
+    
+    if (notifications.length > 0) {
+        await supabase.from('user_notifications').insert(notifications);
+    }
+    
+    await supabase.from('broadcast_history').insert({
+        title, message, target_role: targetRole || 'all',
+        total_sent: notifications.length,
+        created_at: Date.now(),
+        created_by: 'admin'
+    });
+    
+    res.json({ success: true, totalSent: notifications.length });
+});
+
+// Get broadcast history
+app.post('/api/admin/broadcast-history', verifyAdmin, async (req, res) => {
+    const { data } = await supabase.from('broadcast_history').select('*').order('created_at', { ascending: false });
+    res.json({ success: true, broadcasts: data || [] });
+});
+
+// Get system stats
 app.post('/api/admin/stats', verifyAdmin, async (req, res) => {
     const { count: totalKeys } = await supabase.from('keys').select('*', { count: 'exact', head: true });
     const { count: activeKeys } = await supabase.from('keys').select('*', { count: 'exact', head: true }).eq('status', 'active');
     const { count: totalUsers } = await supabase.from('users').select('*', { count: 'exact', head: true });
-    const { count: totalDevices } = await supabase.from('key_devices').select('*', { count: 'exact', head: true }).eq('is_active', true);
-    const { count: bannedUsers } = await supabase.from('users').select('*', { count: 'exact', head: true }).eq('banned', 1);
-    const { count: bannedIps } = await supabase.from('ip_blacklist').select('*', { count: 'exact', head: true });
-    const { count: activeSessions } = await supabase.from('key_sessions').select('*', { count: 'exact', head: true }).eq('is_active', true);
+    const { count: resellers } = await supabase.from('users').select('*', { count: 'exact', head: true }).eq('role', 'reseller');
+    const { data: totalCoins } = await supabase.from('users').select('coins');
+    const coinSum = totalCoins?.reduce((sum, u) => sum + (u.coins || 0), 0) || 0;
     
-    res.json({ success: true, stats: { totalKeys: totalKeys || 0, activeKeys: activeKeys || 0, totalUsers: totalUsers || 0, totalDevices: totalDevices || 0, bannedUsers: bannedUsers || 0, bannedIps: bannedIps || 0, activeSessions: activeSessions || 0 } });
+    res.json({
+        success: true,
+        stats: {
+            totalKeys: totalKeys || 0,
+            activeKeys: activeKeys || 0,
+            totalUsers: totalUsers || 0,
+            resellers: resellers || 0,
+            totalCoins: coinSum
+        }
+    });
 });
 
+// Get all keys (admin)
 app.post('/api/admin/keys', verifyAdmin, async (req, res) => {
     const { data: keys } = await supabase.from('keys').select('*').order('created_at', { ascending: false }).limit(500);
     res.json({ success: true, keys: keys || [] });
 });
 
-app.post('/api/admin/users', verifyAdmin, async (req, res) => {
-    const { data: users } = await supabase.from('users').select('*').order('created_at', { ascending: false }).limit(500);
-    res.json({ success: true, users: users || [] });
-});
-
+// Admin add key (with custom settings)
 app.post('/api/admin/add-key', verifyAdmin, async (req, res) => {
-    try {
-        const { 
-            userId, 
-            keyText, 
-            days = 0, 
-            hours = 0, 
-            minutes = 0, 
-            maxDevices = 1,
-            bindingType = 'device',
-            lockToIp = null
-        } = req.body;
-        
-        if (!userId) {
-            return res.json({ success: false, error: 'User ID required' });
-        }
-        
-        // HITUNG TOTAL HOURS dengan benar
-        const totalHours = (days * 24) + hours + (minutes / 60);
-        if (totalHours <= 0) {
-            return res.json({ success: false, error: 'Duration must be greater than 0' });
-        }
-        
-        const expiryMs = Date.now() + (totalHours * 3600000);
-        const newKey = keyText || generateKey();
-        
-        // Proses binding type
-        let finalLockIp = null;
-        if (lockToIp === '0.0.0.0') {
-            finalLockIp = '0.0.0.0';
-        } else if (lockToIp) {
-            finalLockIp = lockToIp;
-        }
-        
-        const { error } = await supabase.from('keys').insert({
-            key_text: newKey,
-            user_id: userId,
-            duration_hours: totalHours,
-            duration_days: days,
-            duration_minutes: minutes,
-            expiry_ms: expiryMs,
-            created_at: Date.now(),
-            status: 'active',
-            is_admin_key: 1,
-            created_by: 'admin',
-            locked_ip: finalLockIp,
-            max_devices: maxDevices,
-            current_devices: 0,
-            binding_type: bindingType
-        });
-        
-        if (error) {
-            return res.json({ success: false, error: error.message });
-        }
-        
-        // Update atau create user
-        const { data: user } = await supabase
-            .from('users')
-            .select('keys_generated')
-            .eq('user_id', userId)
-            .maybeSingle();
-        
-        if (user) {
-            await supabase
-                .from('users')
-                .update({ keys_generated: (user.keys_generated || 0) + 1 })
-                .eq('user_id', userId);
-        } else {
-            await supabase
-                .from('users')
-                .insert({
-                    user_id: userId,
-                    keys_generated: 1,
-                    created_at: Date.now()
-                });
-        }
-        
-        res.json({ 
-            success: true, 
-            key: newKey, 
-            expiryMs: expiryMs,
-            expiryFormatted: new Date(expiryMs).toLocaleString(),
-            duration: {
-                days: days,
-                hours: hours,
-                minutes: minutes,
-                totalHours: totalHours
-            },
-            maxDevices: maxDevices,
-            message: `✅ Key created! Expires in ${days}d ${hours}h ${minutes}m`
-        });
-        
-    } catch (err) {
-        console.error('Add key error:', err);
-        res.json({ success: false, error: err.message });
-    }
+    const { userId, days, hours, minutes, maxDevices, keyText } = req.body;
+    const totalHours = (days * 24) + hours + (minutes / 60);
+    const expiryMs = Date.now() + (totalHours * 3600000);
+    const newKey = keyText || generateKey();
+    
+    await supabase.from('keys').insert({
+        key_text: newKey,
+        user_id: userId,
+        duration_hours: totalHours,
+        duration_days: days,
+        duration_minutes: minutes,
+        expiry_ms: expiryMs,
+        created_at: Date.now(),
+        status: 'active',
+        is_admin_key: 1,
+        created_by: 'admin',
+        max_devices: maxDevices || 1
+    });
+    
+    res.json({ success: true, key: newKey, expiryFormatted: new Date(expiryMs).toLocaleString() });
 });
 
-app.post('/api/admin/add-bulk-keys', verifyAdmin, async (req, res) => {
-    try {
-        const { 
-            userId, 
-            count = 1, 
-            days = 0, 
-            hours = 0, 
-            minutes = 0, 
-            maxDevices = 1,
-            bindingType = 'device',
-            lockToIp = null
-        } = req.body;
-        
-        if (!userId) {
-            return res.json({ success: false, error: 'User ID required' });
-        }
-        
-        if (count > 100) {
-            return res.json({ success: false, error: 'Max 100 keys at once' });
-        }
-        
-        const totalHours = (days * 24) + hours + (minutes / 60);
-        const expiryMs = Date.now() + (totalHours * 3600000);
-        const keys = [];
-        
-        for (let i = 0; i < count; i++) {
-            const newKey = generateKey();
-            
-            let finalLockIp = null;
-            if (lockToIp === '0.0.0.0') {
-                finalLockIp = '0.0.0.0';
-            } else if (lockToIp) {
-                finalLockIp = lockToIp;
-            }
-            
-            const { error } = await supabase.from('keys').insert({
-                key_text: newKey,
-                user_id: userId,
-                duration_hours: totalHours,
-                duration_days: days,
-                duration_minutes: minutes,
-                expiry_ms: expiryMs,
-                created_at: Date.now(),
-                status: 'active',
-                is_admin_key: 1,
-                created_by: 'admin',
-                locked_ip: finalLockIp,
-                max_devices: maxDevices,
-                current_devices: 0,
-                binding_type: bindingType
-            });
-            
-            if (!error) {
-                keys.push(newKey);
-            }
-        }
-        
-        res.json({ 
-            success: true, 
-            keys: keys,
-            count: keys.length,
-            expiryMs: expiryMs,
-            expiryFormatted: new Date(expiryMs).toLocaleString(),
-            duration: {
-                days: days,
-                hours: hours,
-                minutes: minutes,
-                totalHours: totalHours
-            },
-            message: `✅ Generated ${keys.length} keys! Expires in ${days}d ${hours}h ${minutes}m`
-        });
-        
-    } catch (err) {
-        console.error('Bulk keys error:', err);
-        res.json({ success: false, error: err.message });
-    }
-});
-
+// Admin delete key
 app.post('/api/admin/delete-key', verifyAdmin, async (req, res) => {
     const { key } = req.body;
     await supabase.from('key_sessions').delete().eq('key_text', key);
@@ -913,142 +646,61 @@ app.post('/api/admin/delete-key', verifyAdmin, async (req, res) => {
     res.json({ success: true });
 });
 
-app.post('/api/admin/delete-expired-keys', verifyAdmin, async (req, res) => {
-    await deleteExpiredKeys();
-    res.json({ success: true, message: 'Expired keys deleted' });
+// Admin login
+app.post('/api/admin/login', async (req, res) => {
+    const { username, password } = req.body;
+    if (username === 'admin' && password === ADMIN_PASSWORD) {
+        adminToken = crypto.randomBytes(32).toString('hex');
+        adminTokenExpiry = Date.now() + 3600000;
+        res.json({ success: true, token: adminToken });
+    } else {
+        res.json({ success: false, error: 'Invalid credentials' });
+    }
 });
 
-app.post('/api/admin/delete-all-keys', verifyAdmin, async (req, res) => {
-    await supabase.from('key_sessions').delete().neq('id', 0);
-    await supabase.from('key_devices').delete().neq('id', 0);
-    await supabase.from('keys').delete().neq('id', 0);
-    res.json({ success: true, message: 'All keys deleted' });
-});
-
-app.post('/api/admin/ban-user', verifyAdmin, async (req, res) => {
-    const { userId } = req.body;
-    await supabase.from('users').update({ banned: 1 }).eq('user_id', userId);
-    res.json({ success: true });
-});
-
-app.post('/api/admin/unban-user', verifyAdmin, async (req, res) => {
-    const { userId } = req.body;
-    await supabase.from('users').update({ banned: 0 }).eq('user_id', userId);
-    res.json({ success: true });
-});
-
-app.post('/api/admin/ban-ip', verifyAdmin, async (req, res) => {
-    const { ip, reason } = req.body;
-    if (!ip) return res.json({ success: false, error: 'IP required' });
-    await supabase.from('ip_blacklist').insert({ ip_address: ip, reason: reason || 'No reason', banned_at: Date.now() });
-    res.json({ success: true, message: `IP ${ip} banned` });
-});
-
-app.post('/api/admin/unban-ip', verifyAdmin, async (req, res) => {
-    const { ip } = req.body;
-    await supabase.from('ip_blacklist').delete().eq('ip_address', ip);
-    res.json({ success: true, message: `IP ${ip} unbanned` });
-});
-
-app.post('/api/admin/banned-ips', verifyAdmin, async (req, res) => {
-    const { data } = await supabase.from('ip_blacklist').select('*').order('banned_at', { ascending: false });
-    res.json({ success: true, ips: data || [] });
-});
-
-app.post('/api/admin/ban-device', verifyAdmin, async (req, res) => {
-    const { deviceFingerprint, reason } = req.body;
-    if (!deviceFingerprint) return res.json({ success: false, error: 'Device fingerprint required' });
-    await supabase.from('device_blacklist').insert({ device_fingerprint: deviceFingerprint, reason: reason || 'No reason', banned_at: Date.now() });
-    res.json({ success: true, message: 'Device banned' });
-});
-
-app.post('/api/admin/unban-device', verifyAdmin, async (req, res) => {
-    const { deviceFingerprint } = req.body;
-    if (!deviceFingerprint) return res.json({ success: false, error: 'Device fingerprint required' });
-    await supabase.from('device_blacklist').delete().eq('device_fingerprint', deviceFingerprint);
-    res.json({ success: true, message: 'Device unbanned' });
-});
-
-app.post('/api/admin/banned-devices', verifyAdmin, async (req, res) => {
-    const { data } = await supabase.from('device_blacklist').select('*').order('banned_at', { ascending: false });
-    res.json({ success: true, devices: data || [] });
-});
-
-app.post('/api/admin/key-devices', verifyAdmin, async (req, res) => {
-    const { key } = req.body;
-    if (!key) return res.json({ success: false, error: 'Key required' });
-    const { data: devices } = await supabase.from('key_devices').select('*').eq('key_text', key).eq('is_active', true).order('first_seen', { ascending: false });
-    res.json({ success: true, devices: devices || [] });
-});
-
-app.post('/api/admin/remove-device', verifyAdmin, async (req, res) => {
-    const { key, deviceFingerprint } = req.body;
-    if (!key || !deviceFingerprint) return res.json({ success: false, error: 'Key and device fingerprint required' });
-    
-    await supabase.from('key_devices').update({ is_active: false }).eq('key_text', key).eq('device_fingerprint', deviceFingerprint);
-    const { count: currentDevices } = await supabase.from('key_devices').select('*', { count: 'exact', head: true }).eq('key_text', key).eq('is_active', true);
-    await supabase.from('keys').update({ current_devices: currentDevices }).eq('key_text', key);
-    
-    res.json({ success: true, message: 'Device removed' });
-});
-
-app.post('/api/admin/security-logs', verifyAdmin, async (req, res) => {
-    const { limit = 100 } = req.body;
-    const { data } = await supabase.from('security_logs').select('*').order('timestamp', { ascending: false }).limit(limit);
-    res.json({ success: true, logs: data || [] });
-});
-
-app.post('/api/admin/get-settings', verifyAdmin, async (req, res) => {
-    const { data } = await supabase.from('settings').select('*');
-    const settings = {};
-    if (data) data.forEach(s => { settings[s.key] = s.value; });
-    res.json({ success: true, settings: { default_max_devices: settings.default_max_devices || '1', max_keys_per_user: settings.max_keys_per_user || '5', default_duration_hours: settings.default_duration_hours || '3' } });
-});
-
-app.post('/api/admin/settings', verifyAdmin, async (req, res) => {
-    const { default_max_devices, max_keys_per_user, default_duration_hours } = req.body;
-    if (default_max_devices !== undefined) await supabase.from('settings').upsert({ key: 'default_max_devices', value: default_max_devices.toString(), updated_at: Date.now() }, { onConflict: 'key' });
-    if (max_keys_per_user !== undefined) await supabase.from('settings').upsert({ key: 'max_keys_per_user', value: max_keys_per_user.toString(), updated_at: Date.now() }, { onConflict: 'key' });
-    if (default_duration_hours !== undefined) await supabase.from('settings').upsert({ key: 'default_duration_hours', value: default_duration_hours.toString(), updated_at: Date.now() }, { onConflict: 'key' });
-    res.json({ success: true, message: 'Settings saved' });
-});
-
-app.post('/api/admin/maintenance/settings', verifyAdmin, async (req, res) => {
-    const { data: settings } = await supabase.from('system_settings').select('*').in('key', ['maintenance_mode', 'maintenance_message', 'maintenance_estimated_time']);
-    const result = {};
-    settings?.forEach(s => { result[s.key] = s.value; });
-    res.json({ success: true, settings: { maintenance_mode: result.maintenance_mode || 'false', maintenance_message: result.maintenance_message || 'Server is under maintenance', maintenance_estimated_time: result.maintenance_estimated_time || '30 minutes' } });
-});
-
-app.post('/api/admin/maintenance/enable', verifyAdmin, async (req, res) => {
-    const { message, estimatedTime } = req.body;
-    const now = Date.now();
-    await supabase.from('system_settings').upsert({ key: 'maintenance_mode', value: 'true', updated_at: now, updated_by: 'admin' }, { onConflict: 'key' });
-    if (message) await supabase.from('system_settings').upsert({ key: 'maintenance_message', value: message, updated_at: now }, { onConflict: 'key' });
-    if (estimatedTime) await supabase.from('system_settings').upsert({ key: 'maintenance_estimated_time', value: estimatedTime, updated_at: now }, { onConflict: 'key' });
-    res.json({ success: true, message: 'Maintenance mode enabled' });
-});
-
-app.post('/api/admin/maintenance/disable', verifyAdmin, async (req, res) => {
-    await supabase.from('system_settings').upsert({ key: 'maintenance_mode', value: 'false', updated_at: Date.now(), updated_by: 'admin' }, { onConflict: 'key' });
-    res.json({ success: true, message: 'Maintenance mode disabled' });
-});
-
+// Admin logout
 app.post('/api/admin/logout', verifyAdmin, async (req, res) => {
     adminToken = null;
     adminTokenExpiry = null;
     res.json({ success: true });
 });
 
+// Maintenance APIs
+app.post('/api/admin/maintenance/settings', verifyAdmin, async (req, res) => {
+    const { data: settings } = await supabase.from('system_settings').select('*');
+    const result = {};
+    settings?.forEach(s => { result[s.key] = s.value; });
+    res.json({ success: true, settings: result });
+});
+
+app.post('/api/admin/maintenance/enable', verifyAdmin, async (req, res) => {
+    const { message, estimatedTime } = req.body;
+    await supabase.from('system_settings').upsert({ key: 'maintenance_mode', value: 'true', updated_at: Date.now() });
+    if (message) await supabase.from('system_settings').upsert({ key: 'maintenance_message', value: message, updated_at: Date.now() });
+    if (estimatedTime) await supabase.from('system_settings').upsert({ key: 'maintenance_estimated_time', value: estimatedTime, updated_at: Date.now() });
+    res.json({ success: true });
+});
+
+app.post('/api/admin/maintenance/disable', verifyAdmin, async (req, res) => {
+    await supabase.from('system_settings').upsert({ key: 'maintenance_mode', value: 'false', updated_at: Date.now() });
+    res.json({ success: true });
+});
+
+// Health check
+app.get('/api/health', (req, res) => {
+    res.json({ status: 'healthy', timestamp: Date.now() });
+});
+
 // ============================================================
 // START SERVER
 // ============================================================
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => {
     console.log(`🚀 NEXUS SERVER running on port ${PORT}`);
     console.log(`🔐 Admin login: admin / ${ADMIN_PASSWORD}`);
-    console.log(`📱 Device Limit: Enabled`);
+    console.log(`✅ Reseller system ready`);
+    console.log(`✅ Multi-language ready`);
+    console.log(`✅ Payment gateway ready (Pakasir)`);
 });
 
 module.exports = app;
