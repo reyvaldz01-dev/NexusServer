@@ -251,10 +251,40 @@ function calculatePrice(durationDays, deviceLimit) {
 
 app.post('/api/reseller/login', async (req, res) => {
     const { username, password } = req.body;
-    const { data: user } = await supabase.from('users').select('*').eq('user_id', username).eq('reseller_password', password).eq('role', 'reseller').maybeSingle();
-    if (!user) return res.json({ success: false, error: 'Invalid credentials' });
+    
+    console.log(`Reseller login attempt: ${username}`);
+    
+    // Cek di database
+    const { data: user, error } = await supabase
+        .from('users')
+        .select('*')
+        .eq('user_id', username)
+        .eq('reseller_password', password)
+        .eq('role', 'reseller')
+        .maybeSingle();
+    
+    if (error) {
+        console.error('Database error:', error);
+        return res.json({ success: false, error: 'Database error' });
+    }
+    
+    if (!user) {
+        console.log(`Reseller not found: ${username}`);
+        return res.json({ success: false, error: 'Invalid reseller credentials' });
+    }
+    
+    console.log(`Reseller logged in: ${username}, Coins: ${user.coins}`);
+    
     const token = generateSessionToken();
-    res.json({ success: true, token, user: { user_id: user.user_id, coins: user.coins, language: user.language || 'id' } });
+    res.json({ 
+        success: true, 
+        token, 
+        user: { 
+            user_id: user.user_id, 
+            coins: user.coins, 
+            language: user.language || 'id' 
+        } 
+    });
 });
 
 app.post('/api/reseller/create-key', verifyReseller, async (req, res) => {
