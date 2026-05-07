@@ -558,6 +558,237 @@ app.post('/api/admin/maintenance/disable', verifyAdmin, async (req, res) => {
 });
 
 // ============================================================
+// ENDPOINT YANG HILANG - TAMBAHKAN INI
+// ============================================================
+
+// 1. Delete expired keys
+app.post('/api/admin/delete-expired-keys', verifyAdmin, async (req, res) => {
+    try {
+        const now = Date.now();
+        const { data, error } = await supabase
+            .from('keys')
+            .update({ status: 'expired' })
+            .lt('expiry_ms', now)
+            .eq('status', 'active');
+        
+        res.json({ success: true, message: 'Expired keys deleted' });
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+
+// 2. Delete all keys
+app.post('/api/admin/delete-all-keys', verifyAdmin, async (req, res) => {
+    try {
+        await supabase.from('key_sessions').delete().neq('id', 0);
+        await supabase.from('key_devices').delete().neq('id', 0);
+        await supabase.from('keys').delete().neq('id', 0);
+        res.json({ success: true, message: 'All keys deleted' });
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+
+// 3. Bulk keys (add multiple keys at once)
+app.post('/api/admin/add-bulk-keys', verifyAdmin, async (req, res) => {
+    try {
+        const { userId, count = 1, days = 0, hours = 3, minutes = 0, maxDevices = 1, bindingType = 'device' } = req.body;
+        
+        if (!userId) return res.json({ success: false, error: 'User ID required' });
+        if (count > 100) return res.json({ success: false, error: 'Max 100 keys at once' });
+        
+        const totalHours = (days * 24) + hours + (minutes / 60);
+        const expiryMs = Date.now() + (totalHours * 3600000);
+        const keys = [];
+        
+        for (let i = 0; i < count; i++) {
+            const newKey = generateKey();
+            const { error } = await supabase.from('keys').insert({
+                key_text: newKey, user_id: userId, duration_hours: totalHours, duration_days: days,
+                expiry_ms: expiryMs, created_at: Date.now(), status: 'active', is_admin_key: 1,
+                created_by: 'admin', max_devices: maxDevices, binding_type: bindingType
+            });
+            if (!error) keys.push(newKey);
+        }
+        
+        res.json({ success: true, keys: keys, count: keys.length, expiryFormatted: new Date(expiryMs).toLocaleString() });
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+
+// 4. Reseller keys history
+app.post('/api/admin/reseller-keys', verifyAdmin, async (req, res) => {
+    try {
+        let query = supabase.from('reseller_keys').select('*').order('created_at', { ascending: false }).limit(200);
+        if (req.body.resellerId) query = query.eq('reseller_id', req.body.resellerId);
+        const { data } = await query;
+        res.json({ success: true, keys: data || [] });
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+
+// 5. Banned devices list
+app.post('/api/admin/banned-devices', verifyAdmin, async (req, res) => {
+    try {
+        const { data } = await supabase.from('device_blacklist').select('*').order('banned_at', { ascending: false });
+        res.json({ success: true, devices: data || [] });
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+
+// 6. Ban device
+app.post('/api/admin/ban-device', verifyAdmin, async (req, res) => {
+    try {
+        const { deviceFingerprint, reason } = req.body;
+        if (!deviceFingerprint) return res.json({ success: false, error: 'Device fingerprint required' });
+        await supabase.from('device_blacklist').insert({ device_fingerprint: deviceFingerprint, reason: reason || 'No reason', banned_at: Date.now() });
+        res.json({ success: true, message: 'Device banned' });
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+
+// 7. Unban device
+app.post('/api/admin/unban-device', verifyAdmin, async (req, res) => {
+    try {
+        const { deviceFingerprint } = req.body;
+        await supabase.from('device_blacklist').delete().eq('device_fingerprint', deviceFingerprint);
+        res.json({ success: true, message: 'Device unbanned' });
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+
+// 8. Banned IPs list
+app.post('/api/admin/banned-ips', verifyAdmin, async (req, res) => {
+    try {
+        const { data } = await supabase.from('ip_blacklist').select('*').order('banned_at', { ascending: false });
+        res.json({ success: true, ips: data || [] });
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+
+// 9. Ban IP
+app.post('/api/admin/ban-ip', verifyAdmin, async (req, res) => {
+    try {
+        const { ip, reason } = req.body;
+        if (!ip) return res.json({ success: false, error: 'IP required' });
+        await supabase.from('ip_blacklist').insert({ ip_address: ip, reason: reason || 'No reason', banned_at: Date.now() });
+        res.json({ success: true, message: `IP ${ip} banned` });
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+
+// 10. Unban IP
+app.post('/api/admin/unban-ip', verifyAdmin, async (req, res) => {
+    try {
+        const { ip } = req.body;
+        await supabase.from('ip_blacklist').delete().eq('ip_address', ip);
+        res.json({ success: true, message: `IP ${ip} unbanned` });
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+
+// 11. Security logs
+app.post('/api/admin/security-logs', verifyAdmin, async (req, res) => {
+    try {
+        const { data } = await supabase.from('security_logs').select('*').order('timestamp', { ascending: false }).limit(200);
+        res.json({ success: true, logs: data || [] });
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+
+// 12. Announcements list
+app.post('/api/admin/announcements', verifyAdmin, async (req, res) => {
+    try {
+        const { data } = await supabase.from('announcements').select('*').order('created_at', { ascending: false });
+        res.json({ success: true, announcements: data || [] });
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+
+// 13. Create announcement
+app.post('/api/admin/create-announcement', verifyAdmin, async (req, res) => {
+    try {
+        const { title, content, type } = req.body;
+        if (!title || !content) return res.json({ success: false, error: 'Title and content required' });
+        await supabase.from('announcements').insert({
+            title, content, type: type || 'info', is_active: true,
+            start_date: Date.now(), end_date: Date.now() + 30 * 24 * 3600000,
+            created_at: Date.now(), created_by: 'admin'
+        });
+        res.json({ success: true, message: 'Announcement created' });
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+
+// 14. Delete announcement
+app.post('/api/admin/delete-announcement', verifyAdmin, async (req, res) => {
+    try {
+        const { id } = req.body;
+        await supabase.from('announcements').delete().eq('id', id);
+        res.json({ success: true });
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+
+// 15. Broadcast message
+app.post('/api/admin/broadcast', verifyAdmin, async (req, res) => {
+    try {
+        const { title, message, targetRole } = req.body;
+        let query = supabase.from('users').select('user_id');
+        if (targetRole && targetRole !== 'all') query = query.eq('role', targetRole);
+        const { data: users } = await query;
+        
+        const notifications = users.map(u => ({ user_id: u.user_id, title, message, type: 'broadcast', created_at: Date.now() }));
+        if (notifications.length > 0) await supabase.from('user_notifications').insert(notifications);
+        await supabase.from('broadcast_history').insert({ title, message, target_role: targetRole || 'all', total_sent: notifications.length, created_at: Date.now(), created_by: 'admin' });
+        res.json({ success: true, totalSent: notifications.length });
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+
+// 16. Broadcast history
+app.post('/api/admin/broadcast-history', verifyAdmin, async (req, res) => {
+    try {
+        const { data } = await supabase.from('broadcast_history').select('*').order('created_at', { ascending: false });
+        res.json({ success: true, broadcasts: data || [] });
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+
+// 17. User notifications
+app.get('/api/notifications/:userId', async (req, res) => {
+    try {
+        const { data } = await supabase.from('user_notifications').select('*').eq('user_id', req.params.userId).order('created_at', { ascending: false }).limit(50);
+        res.json({ success: true, notifications: data || [] });
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+
+// 18. Mark notification as read
+app.post('/api/notifications/read', async (req, res) => {
+    try {
+        await supabase.from('user_notifications').update({ is_read: true }).eq('id', req.body.notificationId).eq('user_id', req.body.userId);
+        res.json({ success: true });
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+// ============================================================
 // START SERVER
 // ============================================================
 const PORT = process.env.PORT || 3000;
